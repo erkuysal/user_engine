@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: userengine-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: gateway
+    container_name: userengine-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - JWT_SECRET=${JWT_SECRET:-dev-secret-change-in-production}
+      - GATEWAY_ADDR=:8080
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: api
+    container_name: userengine-api
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - JWT_SECRET=${JWT_SECRET:-dev-secret-change-in-production}
+      - API_ADDR=:8081
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  sweeper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: worker-sweeper
+    container_name: userengine-sweeper
+    environment:
+      - REDIS_ADDR=redis:6379
+      - SWEEP_INTERVAL=30s
+      - SWEEP_BATCH_SIZE=100
+      - SWEEP_TIME_BUDGET=500ms
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  debouncer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: worker-debouncer
+    container_name: userengine-debouncer
+    environment:
+      - REDIS_ADDR=redis:6379
+      - DEBOUNCE_DELAY=5s
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  webhook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: worker-webhook
+    container_name: userengine-webhook
+    environment:
+      - REDIS_ADDR=redis:6379
+      - WEBHOOK_ENABLED=true
+      - WEBHOOK_STREAM_NAME=presence:webhooks
+      - WEBHOOK_CONSUMER_GROUP=webhook-workers
+      - WEBHOOK_RETRY_ATTEMPTS=3
+      - WEBHOOK_TIMEOUT=10s
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+
+networks:
+  default:
+    name: userengine-network
+
