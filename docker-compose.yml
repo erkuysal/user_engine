@@ -1,6 +1,11 @@
 version: '3.8'
 
+x-defaults: &defaults
+  namespace: ${NAMESPACE:-erkuysal/personal-site}
+  version: ${VERSION:-latest}
+
 services:
+  # Standalone Redis for UserEngine testing (optional, usually shared)
   redis:
     image: redis:7-alpine
     container_name: userengine-redis
@@ -14,6 +19,8 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
+    networks:
+      - personalsite_network
 
   gateway:
     build:
@@ -21,17 +28,23 @@ services:
       dockerfile: Dockerfile
       args:
         SERVICE: gateway
+    image: ${NAMESPACE:-erkuysal/personal-site}:userengine-gateway-${VERSION:-latest}
     container_name: userengine-gateway
     ports:
       - "8080:8080"
+    env_file:
+      - .env
     environment:
       - REDIS_ADDR=redis:6379
       - JWT_SECRET=${JWT_SECRET:-dev-secret-change-in-production}
       - GATEWAY_ADDR=:8080
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-https://erkuysal.com,https://www.erkuysal.com}
     depends_on:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - personalsite_network
 
   api:
     build:
@@ -39,9 +52,12 @@ services:
       dockerfile: Dockerfile
       args:
         SERVICE: api
+    image: ${NAMESPACE:-erkuysal/personal-site}:userengine-api-${VERSION:-latest}
     container_name: userengine-api
     ports:
       - "8081:8081"
+    env_file:
+      - .env
     environment:
       - REDIS_ADDR=redis:6379
       - JWT_SECRET=${JWT_SECRET:-dev-secret-change-in-production}
@@ -50,6 +66,8 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - personalsite_network
 
   sweeper:
     build:
@@ -57,7 +75,10 @@ services:
       dockerfile: Dockerfile
       args:
         SERVICE: worker-sweeper
+    image: ${NAMESPACE:-erkuysal/personal-site}:userengine-sweeper-${VERSION:-latest}
     container_name: userengine-sweeper
+    env_file:
+      - .env
     environment:
       - REDIS_ADDR=redis:6379
       - SWEEP_INTERVAL=30s
@@ -67,6 +88,8 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - personalsite_network
 
   debouncer:
     build:
@@ -74,7 +97,10 @@ services:
       dockerfile: Dockerfile
       args:
         SERVICE: worker-debouncer
+    image: ${NAMESPACE:-erkuysal/personal-site}:userengine-debouncer-${VERSION:-latest}
     container_name: userengine-debouncer
+    env_file:
+      - .env
     environment:
       - REDIS_ADDR=redis:6379
       - DEBOUNCE_DELAY=5s
@@ -82,6 +108,8 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - personalsite_network
 
   webhook:
     build:
@@ -89,7 +117,10 @@ services:
       dockerfile: Dockerfile
       args:
         SERVICE: worker-webhook
+    image: ${NAMESPACE:-erkuysal/personal-site}:userengine-webhook-${VERSION:-latest}
     container_name: userengine-webhook
+    env_file:
+      - .env
     environment:
       - REDIS_ADDR=redis:6379
       - WEBHOOK_ENABLED=true
@@ -101,11 +132,13 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - personalsite_network
 
 volumes:
   redis_data:
 
 networks:
-  default:
-    name: userengine-network
+  personalsite_network:
+    external: true
 

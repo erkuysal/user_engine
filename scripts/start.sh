@@ -9,6 +9,14 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BIN_DIR="$PROJECT_DIR/bin"
 LOG_DIR="$PROJECT_DIR/logs"
 
+# Load .env file if it exists
+if [ -f "$PROJECT_DIR/.env" ]; then
+    # Use set -a to automatically export all variables
+    set -a
+    source "$PROJECT_DIR/.env"
+    set +a
+fi
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -47,14 +55,15 @@ check_redis() {
 }
 
 build_services() {
-    echo -e "${YELLOW}Building services...${NC}"
+    echo -e "${YELLOW}Building services (via PowerShell)...${NC}"
     mkdir -p "$BIN_DIR"
     
     cd "$PROJECT_DIR"
-    go build -o "$BIN_DIR/gateway" ./cmd/gateway
-    go build -o "$BIN_DIR/api" ./cmd/api
-    go build -o "$BIN_DIR/sweeper" ./cmd/worker-sweeper
-    go build -o "$BIN_DIR/debouncer" ./cmd/worker-debouncer
+    # Use powershell to invoke go build, creating Windows executables (.exe)
+    powershell.exe -Command "go build -o bin/gateway.exe ./cmd/gateway"
+    powershell.exe -Command "go build -o bin/api.exe ./cmd/api"
+    powershell.exe -Command "go build -o bin/sweeper.exe ./cmd/worker-sweeper"
+    powershell.exe -Command "go build -o bin/debouncer.exe ./cmd/worker-debouncer"
     
     echo -e "${GREEN}✓ All services built${NC}"
 }
@@ -63,6 +72,21 @@ start_service() {
     local name=$1
     local binary=$2
     local log_file="$LOG_DIR/${name}.log"
+    local pid_file="$LOG_DIR/${name}.pid"
+    
+    # Check if already running (Windows check via PowerShell)
+    if powershell.exe -Command "Get-Process -Name '$name' -ErrorAction SilentlyContinue" > /dev/null 2>&1; then
+        echo -e "${YELLOW}○ $name is already running (checked via PowerShell)${NC}"
+        # If PID file exists but process is controlled by Windows, just keep it or ignore it.
+        # But if it's stale, we might want to update it?
+        # For now, just return 0 to skip starting.
+        return 0
+    fi
+    
+    # Check PID file (legacy/fallback, mostly to clean up stale files)
+    if [ -f "$pid_file" ]; then
+        rm -f "$pid_file"
+    fi
     
     echo -e "${BLUE}Starting $name...${NC}"
     
@@ -71,10 +95,12 @@ start_service() {
     export JWT_SECRET
     export GATEWAY_ADDR
     export API_ADDR
+    # Ensure Windows processes inherit these environment variables
+    export WSLENV=REDIS_ADDR:JWT_SECRET:GATEWAY_ADDR:API_ADDR
     
     nohup "$binary" > "$log_file" 2>&1 &
     local pid=$!
-    echo $pid > "$LOG_DIR/${name}.pid"
+    echo $pid > "$pid_file"
     
     sleep 0.5
     if kill -0 $pid 2>/dev/null; then
@@ -90,11 +116,11 @@ start_service() {
 start_all() {
     mkdir -p "$LOG_DIR"
     
-    # Start services
-    start_service "gateway" "$BIN_DIR/gateway"
-    start_service "api" "$BIN_DIR/api"
-    start_service "sweeper" "$BIN_DIR/sweeper"
-    start_service "debouncer" "$BIN_DIR/debouncer"
+    # Start services (using .exe binaries)
+    start_service "gateway" "$BIN_DIR/gateway.exe"
+    start_service "api" "$BIN_DIR/api.exe"
+    start_service "sweeper" "$BIN_DIR/sweeper.exe"
+    start_service "debouncer" "$BIN_DIR/debouncer.exe"
     
     echo ""
     echo -e "${GREEN}═══════════════════════════════════════════${NC}"
@@ -114,10 +140,14 @@ print_banner
 
 # Parse arguments
 BUILD=false
+DETACH=false
 for arg in "$@"; do
     case $arg in
         --build|-b)
             BUILD=true
+            ;;
+        --detach|-d)
+            DETACH=true
             ;;
     esac
 done
@@ -126,10 +156,27 @@ done
 check_redis || exit 1
 
 # Build if requested or binaries don't exist
-if [ "$BUILD" = true ] || [ ! -f "$BIN_DIR/gateway" ]; then
+if [ "$BUILD" = true ] || [ ! -f "$BIN_DIR/gateway.exe" ]; then
     build_services
 fi
 
 # Start all services
 start_all
+
+if [ "$DETACH" = true ]; then
+    echo -e "${YELLOW}Running in background mode.${NC}"
+else
+    echo -e "${YELLOW}Running in foreground mode (Ctrl+C to stop)...${NC}"
+    echo -e "${BLUE}Tailing logs...${NC}"
+    
+    # Trap Ctrl+C (SIGINT) and SIGTERM to stop services
+    trap "./scripts/stop.sh; exit 0" SIGINT SIGTERM
+    
+    # Tail all logs
+    tail -f "$LOG_DIR"/*.log &
+    TAIL_PID=$!
+    
+    # Wait for the tail process (this keeps the script running)
+    wait $TAIL_PID
+fi
 

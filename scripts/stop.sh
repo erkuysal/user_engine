@@ -16,19 +16,22 @@ echo -e "${YELLOW}Stopping UserEngine services...${NC}"
 
 stop_service() {
     local name=$1
-    local pid_file="$LOG_DIR/${name}.pid"
+    local binary_name="${name}.exe"
     
-    if [ -f "$pid_file" ]; then
-        local pid=$(cat "$pid_file")
-        if kill -0 $pid 2>/dev/null; then
-            kill $pid
-            echo -e "${GREEN}✓ Stopped $name (PID: $pid)${NC}"
-        else
-            echo -e "${YELLOW}○ $name was not running${NC}"
-        fi
-        rm -f "$pid_file"
+    # Try to kill by name using Windows taskkill (more reliable/aggressive for this setup)
+    if powershell.exe -Command "Get-Process -Name '$name' -ErrorAction SilentlyContinue" > /dev/null; then
+        echo -e "${YELLOW}Stopping $name...${NC}"
+        # /F = force, /IM = image name, /T = tree (kill children)
+        powershell.exe -Command "taskkill /F /IM '$binary_name' /T" > /dev/null 2>&1
+        echo -e "${GREEN}✓ Stopped $binary_name${NC}"
     else
-        echo -e "${YELLOW}○ $name pid file not found${NC}"
+        echo -e "${YELLOW}○ $name not running (checked via PowerShell)${NC}"
+    fi
+
+    # Clean up pid file if it exists, just in case
+    local pid_file="$LOG_DIR/${name}.pid"
+    if [ -f "$pid_file" ]; then
+        rm -f "$pid_file"
     fi
 }
 

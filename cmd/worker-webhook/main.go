@@ -9,6 +9,8 @@ import (
 	"github.com/userengine/presence/pkg/config"
 	"github.com/userengine/presence/pkg/webhooks"
 
+	"net/http"
+
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -32,6 +34,18 @@ func main() {
 		Str("stream", cfg.WebhookStreamName).
 		Str("group", cfg.WebhookConsumerGroup).
 		Msg("starting webhook worker")
+
+	// Start health check server
+	go func() {
+		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		})
+		log.Info().Msg("starting health check server on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Error().Err(err).Msg("health check server failed")
+		}
+	}()
 
 	// Connect to Redis
 	rdb := redis.NewClient(&redis.Options{

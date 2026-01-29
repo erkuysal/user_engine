@@ -4,7 +4,7 @@
 # ============================================
 # Build Stage
 # ============================================
-FROM golang:1.21-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 ARG SERVICE=gateway
 

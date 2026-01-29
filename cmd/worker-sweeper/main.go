@@ -13,6 +13,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"net/http"
 )
 
 func main() {
@@ -23,6 +24,18 @@ func main() {
 	// Load config
 	cfg := config.Load()
 	log.Info().Msg("starting sweeper worker")
+
+	// Start health check server
+	go func() {
+		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		})
+		log.Info().Msg("starting health check server on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Error().Err(err).Msg("health check server failed")
+		}
+	}()
 
 	// Connect to Redis
 	rdb := redis.NewClient(&redis.Options{
