@@ -341,28 +341,52 @@ func (c *Client) connect() error {
 }
 
 func (c *Client) handleHeartbeat() {
+	now := time.Now()
 	c.mu.Lock()
-	timeSinceLast := time.Since(c.lastHeartbeat)
+	lastHB := c.lastHeartbeat
+	timeSinceLast := now.Sub(lastHB)
 	c.mu.Unlock()
+
+	// DEBUG: Log every heartbeat attempt with detailed timing
+	log.Info().
+		Str("session_id", c.sessionID).
+		Str("user_id", c.userID).
+		Dur("since_last_hb", timeSinceLast).
+		Time("last_hb_at", lastHB).
+		Time("now", now).
+		Dur("rate_limit", c.hub.HeartbeatRateLimit()).
+		Msg("[DEBUG] heartbeat received from client")
 
 	// Rate limit heartbeats
 	if timeSinceLast < c.hub.HeartbeatRateLimit() {
 		metrics.Global().IncHeartbeat(false) // rejected
 		log.Warn().
 			Str("session_id", c.sessionID).
+			Str("user_id", c.userID).
 			Dur("since_last", timeSinceLast).
-			Msg("heartbeat rate limited")
+			Dur("rate_limit", c.hub.HeartbeatRateLimit()).
+			Msg("[DEBUG] heartbeat REJECTED - rate limited")
 		return
 	}
 
 	ctx := context.Background()
 	svc := c.hub.PresenceService()
 
+	log.Debug().
+		Str("session_id", c.sessionID).
+		Str("scope_id", c.scopeID).
+		Msg("[DEBUG] calling svc.Heartbeat to refresh session TTL")
+
 	err := svc.Heartbeat(ctx, c.scopeID, c.sessionID)
 	if err != nil {
 		metrics.Global().IncHeartbeat(false) // rejected
 		if err == presence.ErrSessionUnknown {
 			// Session expired, send reconnect_required and close with application code
+			log.Error().
+				Str("session_id", c.sessionID).
+				Str("user_id", c.userID).
+				Dur("since_last_hb", timeSinceLast).
+				Msg("[DEBUG] SESSION EXPIRED - heartbeat found no session in Redis! Sending reconnect_required")
 			c.sendReconnectRequired("session_expired")
 			c.conn.WriteControl(
 				websocket.CloseMessage,
@@ -372,7 +396,11 @@ func (c *Client) handleHeartbeat() {
 			c.conn.Close()
 			return
 		}
-		log.Error().Err(err).Str("session_id", c.sessionID).Msg("heartbeat failed")
+		log.Error().
+			Err(err).
+			Str("session_id", c.sessionID).
+			Str("user_id", c.userID).
+			Msg("[DEBUG] heartbeat Redis operation failed")
 		return
 	}
 
@@ -382,7 +410,11 @@ func (c *Client) handleHeartbeat() {
 	c.lastHeartbeat = time.Now()
 	c.mu.Unlock()
 
-	log.Debug().Str("session_id", c.sessionID).Msg("heartbeat ok")
+	log.Info().
+		Str("session_id", c.sessionID).
+		Str("user_id", c.userID).
+		Dur("interval", timeSinceLast).
+		Msg("[DEBUG] heartbeat OK - session TTL refreshed")
 }
 
 func (c *Client) sendReconnectRequired(reason string) {

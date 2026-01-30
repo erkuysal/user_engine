@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/rs/zerolog/log"
 )
 
 //go:embed lua/connect.lua
@@ -120,6 +121,7 @@ func (s *Service) LoadScripts(ctx context.Context) error {
 // If meta.Invisible is true, the user will receive events but appear offline to others.
 func (s *Service) Connect(ctx context.Context, meta SessionMeta) (*TransitionResult, error) {
 	if s.connectSHA == "" {
+		log.Error().Msg("[DEBUG] Connect called but scripts not loaded!")
 		return nil, ErrScriptNotLoaded
 	}
 
@@ -128,8 +130,20 @@ func (s *Service) Connect(ctx context.Context, meta SessionMeta) (*TransitionRes
 		return nil, err
 	}
 
+	sessionKey := s.keys.Session(meta.ScopeID, meta.SessionID)
+	ttlSeconds := int(s.sessionTTL.Seconds())
+
+	log.Info().
+		Str("user_id", meta.UserID).
+		Str("session_id", meta.SessionID).
+		Str("scope_id", meta.ScopeID).
+		Str("session_key", sessionKey).
+		Int("ttl_seconds", ttlSeconds).
+		Dur("session_ttl", s.sessionTTL).
+		Msg("[DEBUG] Connect: creating new session in Redis")
+
 	keys := []string{
-		s.keys.Session(meta.ScopeID, meta.SessionID),
+		sessionKey,
 		s.keys.UserSessions(meta.ScopeID, meta.UserID),
 		s.keys.OnlineUsers(meta.ScopeID),
 		s.keys.UserVersion(meta.ScopeID, meta.UserID),
@@ -138,7 +152,7 @@ func (s *Service) Connect(ctx context.Context, meta SessionMeta) (*TransitionRes
 
 	args := []interface{}{
 		string(metaJSON),
-		int(s.sessionTTL.Seconds()),
+		ttlSeconds,
 		meta.SessionID,
 		meta.UserID,
 		meta.ScopeID,
@@ -146,6 +160,11 @@ func (s *Service) Connect(ctx context.Context, meta SessionMeta) (*TransitionRes
 
 	result, err := s.rdb.EvalSha(ctx, s.connectSHA, keys, args...).Result()
 	if err != nil {
+		log.Error().
+			Err(err).
+			Str("user_id", meta.UserID).
+			Str("session_id", meta.SessionID).
+			Msg("[DEBUG] Connect: Redis EvalSha failed")
 		return nil, err
 	}
 
@@ -153,6 +172,15 @@ func (s *Service) Connect(ctx context.Context, meta SessionMeta) (*TransitionRes
 	if err != nil {
 		return nil, err
 	}
+
+	log.Info().
+		Str("user_id", meta.UserID).
+		Str("session_id", meta.SessionID).
+		Str("transition", transitionResult.Transition).
+		Int64("session_count", transitionResult.SessionCount).
+		Int64("version", transitionResult.Version).
+		Int("ttl_seconds", ttlSeconds).
+		Msg("[DEBUG] Connect: session created successfully")
 
 	// Handle invisible mode
 	if meta.Invisible {
@@ -177,25 +205,50 @@ func (s *Service) Connect(ctx context.Context, meta SessionMeta) (*TransitionRes
 // Returns ErrSessionUnknown if session is expired or doesn't exist.
 func (s *Service) Heartbeat(ctx context.Context, scopeID, sessionID string) error {
 	if s.heartbeatSHA == "" {
+		log.Error().Msg("[DEBUG] Heartbeat called but scripts not loaded!")
 		return ErrScriptNotLoaded
 	}
 
-	keys := []string{
-		s.keys.Session(scopeID, sessionID),
-	}
+	sessionKey := s.keys.Session(scopeID, sessionID)
+	ttlSeconds := int(s.sessionTTL.Seconds())
 
-	args := []interface{}{
-		int(s.sessionTTL.Seconds()),
-	}
+	log.Debug().
+		Str("session_id", sessionID).
+		Str("scope_id", scopeID).
+		Str("session_key", sessionKey).
+		Int("ttl_seconds", ttlSeconds).
+		Msg("[DEBUG] Heartbeat: refreshing session TTL in Redis")
+
+	keys := []string{sessionKey}
+	args := []interface{}{ttlSeconds}
 
 	result, err := s.rdb.EvalSha(ctx, s.heartbeatSHA, keys, args...).Result()
 	if err != nil {
+		log.Error().
+			Err(err).
+			Str("session_id", sessionID).
+			Str("session_key", sessionKey).
+			Msg("[DEBUG] Heartbeat: Redis EvalSha failed")
 		return err
 	}
 
+	log.Debug().
+		Str("session_id", sessionID).
+		Interface("result", result).
+		Msg("[DEBUG] Heartbeat: Lua script result")
+
 	if result == "UNKNOWN" {
+		log.Warn().
+			Str("session_id", sessionID).
+			Str("session_key", sessionKey).
+			Msg("[DEBUG] Heartbeat: session not found in Redis - EXPIRED or NEVER EXISTED")
 		return ErrSessionUnknown
 	}
+
+	log.Debug().
+		Str("session_id", sessionID).
+		Int("new_ttl", ttlSeconds).
+		Msg("[DEBUG] Heartbeat: session TTL refreshed successfully")
 
 	return nil
 }
@@ -436,26 +489,26 @@ func (s *Service) GetActiveScopes(ctx context.Context) ([]string, error) {
 
 // UserDeviceInfo represents device presence information for a user.
 type UserDeviceInfo struct {
-	UserID        string            `json:"user_id"`
-	Online        bool              `json:"online"`
-	Devices       map[string]int64  `json:"devices"`       // device_type -> session_count
-	PrimaryDevice string            `json:"primary_device"` // Highest priority device
-	TotalSessions int64             `json:"total_sessions"`
+	UserID        string           `json:"user_id"`
+	Online        bool             `json:"online"`
+	Devices       map[string]int64 `json:"devices"`        // device_type -> session_count
+	PrimaryDevice string           `json:"primary_device"` // Highest priority device
+	TotalSessions int64            `json:"total_sessions"`
 }
 
 // GetUserDevices returns device information for a user in a scope.
 func (s *Service) GetUserDevices(ctx context.Context, scopeID, userID string) (*UserDeviceInfo, error) {
 	pipe := s.rdb.Pipeline()
-	
+
 	isOnlineCmd := pipe.SIsMember(ctx, s.keys.OnlineUsers(scopeID), userID)
 	devicesCmd := pipe.HGetAll(ctx, s.keys.UserDevices(scopeID, userID))
 	sessionCountCmd := pipe.SCard(ctx, s.keys.UserSessions(scopeID, userID))
-	
+
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	devices := make(map[string]int64)
 	for deviceType, countStr := range devicesCmd.Val() {
 		count, err := parseInt64(countStr)
@@ -463,7 +516,7 @@ func (s *Service) GetUserDevices(ctx context.Context, scopeID, userID string) (*
 			devices[deviceType] = count
 		}
 	}
-	
+
 	info := &UserDeviceInfo{
 		UserID:        userID,
 		Online:        isOnlineCmd.Val(),
@@ -471,7 +524,7 @@ func (s *Service) GetUserDevices(ctx context.Context, scopeID, userID string) (*
 		PrimaryDevice: derivePrimaryDevice(devices),
 		TotalSessions: sessionCountCmd.Val(),
 	}
-	
+
 	return info, nil
 }
 
@@ -480,15 +533,15 @@ func (s *Service) GetUsersDevices(ctx context.Context, scopeID string, userIDs [
 	if len(userIDs) == 0 {
 		return make(map[string]*UserDeviceInfo), nil
 	}
-	
+
 	pipe := s.rdb.Pipeline()
-	
+
 	type userCmds struct {
 		isOnline     *redis.BoolCmd
 		devices      *redis.StringStringMapCmd
 		sessionCount *redis.IntCmd
 	}
-	
+
 	cmds := make([]userCmds, len(userIDs))
 	for i, userID := range userIDs {
 		cmds[i] = userCmds{
@@ -497,12 +550,12 @@ func (s *Service) GetUsersDevices(ctx context.Context, scopeID string, userIDs [
 			sessionCount: pipe.SCard(ctx, s.keys.UserSessions(scopeID, userID)),
 		}
 	}
-	
+
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	result := make(map[string]*UserDeviceInfo, len(userIDs))
 	for i, userID := range userIDs {
 		devices := make(map[string]int64)
@@ -512,7 +565,7 @@ func (s *Service) GetUsersDevices(ctx context.Context, scopeID string, userIDs [
 				devices[deviceType] = count
 			}
 		}
-		
+
 		result[userID] = &UserDeviceInfo{
 			UserID:        userID,
 			Online:        cmds[i].isOnline.Val(),
@@ -521,7 +574,7 @@ func (s *Service) GetUsersDevices(ctx context.Context, scopeID string, userIDs [
 			TotalSessions: cmds[i].sessionCount.Val(),
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -529,20 +582,20 @@ func (s *Service) GetUsersDevices(ctx context.Context, scopeID string, userIDs [
 // Priority: desktop > tablet > mobile > unknown
 func derivePrimaryDevice(devices map[string]int64) string {
 	priority := []string{"desktop", "tablet", "mobile", "unknown"}
-	
+
 	for _, deviceType := range priority {
 		if count, ok := devices[deviceType]; ok && count > 0 {
 			return deviceType
 		}
 	}
-	
+
 	// Return the first device type found if none match priority
 	for deviceType, count := range devices {
 		if count > 0 {
 			return deviceType
 		}
 	}
-	
+
 	return ""
 }
 

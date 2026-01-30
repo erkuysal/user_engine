@@ -188,6 +188,12 @@ func (s *Sweeper) sweepUser(ctx context.Context, scopeID, userID string) (pruned
 		return 0, false, err
 	}
 
+	log.Debug().
+		Str("scope_id", scopeID).
+		Str("user_id", userID).
+		Int("session_count", len(sessions)).
+		Msg("[DEBUG] sweeper: checking user sessions")
+
 	// Check each session
 	for _, sessionID := range sessions {
 		sessionKey := keys.Session(scopeID, sessionID)
@@ -198,8 +204,20 @@ func (s *Sweeper) sweepUser(ctx context.Context, scopeID, userID string) (pruned
 
 		if exists == 0 {
 			// Session expired, remove from user's session set
+			log.Warn().
+				Str("scope_id", scopeID).
+				Str("user_id", userID).
+				Str("session_id", sessionID).
+				Str("session_key", sessionKey).
+				Msg("[DEBUG] sweeper: session EXPIRED - Redis key not found, removing from user sessions")
 			rdb.SRem(ctx, userSessionsKey, sessionID)
 			prunedCount++
+		} else {
+			log.Debug().
+				Str("scope_id", scopeID).
+				Str("user_id", userID).
+				Str("session_id", sessionID).
+				Msg("[DEBUG] sweeper: session still valid")
 		}
 	}
 
@@ -211,6 +229,11 @@ func (s *Sweeper) sweepUser(ctx context.Context, scopeID, userID string) (pruned
 
 	if remaining == 0 {
 		// User went offline
+		log.Warn().
+			Str("scope_id", scopeID).
+			Str("user_id", userID).
+			Int("pruned_count", prunedCount).
+			Msg("[DEBUG] sweeper: user has NO remaining sessions - marking OFFLINE")
 		onlineUsersKey := keys.OnlineUsers(scopeID)
 		versionKey := keys.UserVersion(scopeID, userID)
 
