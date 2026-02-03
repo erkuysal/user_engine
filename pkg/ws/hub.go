@@ -318,9 +318,21 @@ func (h *Hub) broadcastToScope(scopeID string, event events.PresenceEvent) {
 	// Record event consumption
 	metrics.Global().IncEventConsumed(event.Type)
 
+	sentCount := 0
 	for client := range clients {
+		// Filter: Only send event if:
+		// 1. It's about the client's own user (always deliver own events)
+		// 2. The client has subscribed to this user's presence
+		isOwnEvent := client.userID == event.UserID
+		isSubscribed := client.IsSubscribedTo(event.UserID)
+
+		if !isOwnEvent && !isSubscribed {
+			continue // Skip - client didn't subscribe to this user
+		}
+
 		select {
 		case client.send <- data:
+			sentCount++
 		default:
 			// Slow consumer, drop event
 			metrics.Global().IncEventDropped()
@@ -331,6 +343,14 @@ func (h *Hub) broadcastToScope(scopeID string, event events.PresenceEvent) {
 				Msg("dropping event for slow consumer")
 		}
 	}
+
+	log.Debug().
+		Str("scope_id", scopeID).
+		Str("event_type", event.Type).
+		Str("event_user_id", event.UserID).
+		Int("total_clients", len(clients)).
+		Int("sent_to", sentCount).
+		Msg("broadcast presence event")
 }
 
 // PresenceService returns the presence service for client use.

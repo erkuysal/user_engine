@@ -4,7 +4,8 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-LOG_DIR="$PROJECT_DIR/logs"
+# Use USERENGINE_LOG_DIR if set (from ops.sh), otherwise default to local logs
+LOG_DIR="${USERENGINE_LOG_DIR:-$PROJECT_DIR/logs}"
 
 # Colors
 RED='\033[0;31m'

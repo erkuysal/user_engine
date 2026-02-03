@@ -33,11 +33,20 @@ type Client struct {
 	lastHeartbeat time.Time
 	mu            sync.Mutex
 	normalClose   bool
+
+	// subscribedUsers holds user IDs this client wants presence events for (friend subscriptions)
+	subscribedUsers map[string]struct{}
 }
 
 // ClientMessage represents an incoming message from a client.
 type ClientMessage struct {
-	Type string `json:"type"`
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+// SubscribeFriendsPayload is the payload for subscribe_friends messages.
+type SubscribeFriendsPayload struct {
+	UserIDs []string `json:"user_ids"`
 }
 
 // NewClient creates a new WebSocket client.
@@ -121,6 +130,8 @@ func (c *Client) ReadPump() {
 		switch msg.Type {
 		case "heartbeat":
 			c.handleHeartbeat()
+		case "subscribe_friends":
+			c.handleSubscribeFriends(msg.Payload)
 		}
 	}
 }
@@ -433,4 +444,46 @@ func (c *Client) sendReconnectRequired(reason string) {
 		Str("session_id", c.sessionID).
 		Str("reason", reason).
 		Msg("sent reconnect_required")
+}
+
+// handleSubscribeFriends handles friend subscription requests.
+// Clients send this to subscribe to presence events for specific user IDs (friends).
+func (c *Client) handleSubscribeFriends(payload json.RawMessage) {
+	var sub SubscribeFriendsPayload
+	if err := json.Unmarshal(payload, &sub); err != nil {
+		log.Warn().
+			Err(err).
+			Str("session_id", c.sessionID).
+			Msg("invalid subscribe_friends payload")
+		return
+	}
+
+	// Limit subscriptions to prevent abuse
+	const maxSubscriptions = 1000
+	if len(sub.UserIDs) > maxSubscriptions {
+		sub.UserIDs = sub.UserIDs[:maxSubscriptions]
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Replace current subscriptions (additive would require unsubscribe logic)
+	c.subscribedUsers = make(map[string]struct{}, len(sub.UserIDs))
+	for _, userID := range sub.UserIDs {
+		c.subscribedUsers[userID] = struct{}{}
+	}
+
+	log.Debug().
+		Str("session_id", c.sessionID).
+		Str("user_id", c.userID).
+		Int("friend_count", len(c.subscribedUsers)).
+		Msg("subscribed to friend presence events")
+}
+
+// IsSubscribedTo returns true if the client is subscribed to events for the given user ID.
+func (c *Client) IsSubscribedTo(userID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.subscribedUsers[userID]
+	return ok
 }

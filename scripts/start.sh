@@ -1,20 +1,56 @@
 #!/bin/bash
 # UserEngine - Start All Services
-# Usage: ./scripts/start.sh [--build]
+# Usage: ./scripts/start.sh [--build] [--production]
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BIN_DIR="$PROJECT_DIR/bin"
-LOG_DIR="$PROJECT_DIR/logs"
+# Use USERENGINE_LOG_DIR if set (from ops.sh), otherwise default to local logs
+LOG_DIR="${USERENGINE_LOG_DIR:-$PROJECT_DIR/logs}"
+
+# Parse arguments
+BUILD=false
+PRODUCTION=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --build)
+            BUILD=true
+            shift
+            ;;
+        --production)
+            PRODUCTION=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--build] [--production]"
+            exit 1
+            ;;
+    esac
+done
+
+# Set environment mode
+if [ "$PRODUCTION" = true ]; then
+    export ENVIRONMENT="production"
+    echo -e "${RED}Running in PRODUCTION mode${NC}"
+else
+    export ENVIRONMENT="${ENVIRONMENT:-development}"
+    echo -e "${GREEN}Running in $ENVIRONMENT mode${NC}"
+fi
 
 # Load .env file if it exists
 if [ -f "$PROJECT_DIR/.env" ]; then
-    # Use set -a to automatically export all variables
+    echo "Loading configuration from .env"
     set -a
     source "$PROJECT_DIR/.env"
     set +a
+    # Restore ENVIRONMENT if we set it explicitly
+    if [ "$PRODUCTION" = true ]; then
+        export ENVIRONMENT="production"
+    fi
 fi
 
 # Colors
@@ -22,6 +58,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Configuration (can be overridden by environment)
@@ -30,12 +67,42 @@ JWT_SECRET="${JWT_SECRET:-dev-secret-change-in-production}"
 GATEWAY_ADDR="${GATEWAY_ADDR:-:8080}"
 API_ADDR="${API_ADDR:-:8081}"
 
+# Validate production configuration
+if [ "$ENVIRONMENT" = "production" ]; then
+    echo -e "${YELLOW}Validating production configuration...${NC}"
+    
+    if [[ "$JWT_SECRET" == dev-secret* ]]; then
+        echo -e "${RED}❌ Error: JWT_SECRET must be changed for production${NC}"
+        echo -e "${YELLOW}   Set a secure JWT_SECRET in your .env file${NC}"
+        exit 1
+    fi
+    
+    if [[ "${CORS_ALLOW_ALL,,}" == "true" ]]; then
+        echo -e "${RED}❌ Error: CORS_ALLOW_ALL=true is not allowed in production${NC}"
+        exit 1
+    fi
+    
+    if [ -z "$CORS_ALLOWED_ORIGINS" ]; then
+        echo -e "${RED}❌ Error: CORS_ALLOWED_ORIGINS must be set in production${NC}"
+        exit 1
+    fi
+    
+    echo -e "${GREEN}✓ Production configuration is valid${NC}"
+fi
+
 print_banner() {
+    local env_color=$GREEN
+    if [ "$ENVIRONMENT" == "production" ]; then
+        env_color=$RED
+    fi
+    
     echo -e "${BLUE}"
     echo "╔═══════════════════════════════════════════╗"
     echo "║         UserEngine Presence Engine        ║"
     echo "╚═══════════════════════════════════════════╝"
     echo -e "${NC}"
+    echo -e "  ${YELLOW}Environment:${NC} ${env_color}$ENVIRONMENT${NC}"
+    echo ""
 }
 
 check_redis() {
@@ -138,20 +205,6 @@ start_all() {
 # Main
 print_banner
 
-# Parse arguments
-BUILD=false
-DETACH=false
-for arg in "$@"; do
-    case $arg in
-        --build|-b)
-            BUILD=true
-            ;;
-        --detach|-d)
-            DETACH=true
-            ;;
-    esac
-done
-
 # Check Redis
 check_redis || exit 1
 
@@ -163,20 +216,8 @@ fi
 # Start all services
 start_all
 
-if [ "$DETACH" = true ]; then
-    echo -e "${YELLOW}Running in background mode.${NC}"
-else
-    echo -e "${YELLOW}Running in foreground mode (Ctrl+C to stop)...${NC}"
-    echo -e "${BLUE}Tailing logs...${NC}"
-    
-    # Trap Ctrl+C (SIGINT) and SIGTERM to stop services
-    trap "./scripts/stop.sh; exit 0" SIGINT SIGTERM
-    
-    # Tail all logs
-    tail -f "$LOG_DIR"/*.log &
-    TAIL_PID=$!
-    
-    # Wait for the tail process (this keeps the script running)
-    wait $TAIL_PID
-fi
+# Keep running in foreground by default when called from Make
+echo -e "${YELLOW}Services started. Press Ctrl+C to stop...${NC}"
+trap "./scripts/stop.sh; exit 0" SIGINT SIGTERM
+wait
 

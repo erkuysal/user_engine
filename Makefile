@@ -26,6 +26,10 @@ build:
 run: build
 	@./scripts/start.sh
 
+# Run in production mode (sets ENVIRONMENT=production)
+run-prod: build
+	@ENVIRONMENT=production ./scripts/start.sh
+
 # Run with hot-reload (requires air: go install github.com/cosmtrek/air@latest)
 dev:
 	@echo "Starting in development mode..."
@@ -71,25 +75,30 @@ docker-logs:
 docker-build:
 	@docker-compose build
 
-# Redis commands
-redis-start:
-	@docker run -d --name userengine-redis -p 6379:6379 redis:7-alpine || docker start userengine-redis
-	@echo "✓ Redis started"
+# Production Docker commands
+docker-prod-up:
+	@if [ ! -f .env.production ]; then \
+		echo "❌ Error: .env.production not found"; \
+		echo "   Copy .env.production.template to .env.production and configure it"; \
+		exit 1; \
+	fi
+	@docker-compose -f docker-compose.prod.yml --env-file .env.production up -d
+	@echo "✓ Production Docker services started"
 
-redis-stop:
-	@docker stop userengine-redis
-	@echo "✓ Redis stopped"
+docker-prod-down:
+	@docker-compose -f docker-compose.prod.yml down
+	@echo "✓ Production Docker services stopped"
 
-redis-cli:
-	@redis-cli
+docker-prod-logs:
+	@docker-compose -f docker-compose.prod.yml logs -f
 
-# Generate JWT token for testing
-token:
-	@go run test/demo.go 2>/dev/null | grep -A1 "JWT Token" | tail -1
+docker-prod-build:
+	@docker-compose -f docker-compose.prod.yml build
 
-# Run interactive demo
-demo:
-	@go run test/interactive.go
+doRun Docker in production mode (sets ENVIRONMENT=production)
+docker-prod:
+	@ENVIRONMENT=production docker-compose up -d
+	@echo "✓ Docker services started in production mode
 
 # Format code
 fmt:
@@ -109,31 +118,79 @@ help:
 	@echo "UserEngine - Available targets:"
 	@echo ""
 	@echo "  Build & Run:"
-	@echo "    make build      - Build all services"
-	@echo "    make run        - Build and start all services"
-	@echo "    make stop       - Stop all services"
-	@echo "    make status     - Check service status"
-	@echo "    make dev        - Run with hot-reload (requires air)"
+	@echo "    make build          - Build all services"
+	@echo "    make run            - Build and start in development mode"
+	@echo "    make run-prod       - Build and start in production mode"
+	@echo "    make stop           - Stop all services"
+	@echo "    make status         - Check service status"
+	@echo "    make dev            - Run with hot-reload (requires air)"
+	@echo ""
+	@echo "  Environment:"
+	@echo "    make validate-env   - Validate current environment config (ENV=development)"
+	@echo "    make validate-prod  - Validate production configuration"
 	@echo ""
 	@echo "  Testing:"
-	@echo "    make test       - Run tests"
-	@echo "    make test-cover - Run tests with coverage"
-	@echo "    make demo       - Run interactive demo"
+	@echo "    make test           - Run tests"
+	@echo "    make test-cover     - Run tests with coverage"
+	@echo "    make demo           - Run interactive demo"
 	@echo ""
-	@echo "  Docker:"
-	@echo "    make docker-up    - Start with docker-compose"
-	@echo "    make docker-down  - Stop docker-compose"
-	@echo "    make docker-logs  - View docker logs"
+	@echo "  Docker (Development):"
+	@echo "    make docker-up      - Start with docker-compose"
+	@echo "    make docker-down    - Stop docker-compose"
+	@echo "    make docker-logs    - View docker logs"
+	@echo "    make docker-build   - Build docker images"
+	@echo ""
+	@echo "  Docker (Production):"
+	@echo "    make docker-prod-up       - Start production services"
+	@echo "    make docker-prod-down     - Stop production services"
+	@echo "    make docker-prod-logs     - View production logs"
+	@echo "    make docker-prod-build    - Build production images"
+	@echo "    make docker-prod-validate - Validate production compose config"
 	@echo ""
 	@echo "  Redis:"
-	@echo "    make redis-start - Start Redis container"
-	@echo "    make redis-stop  - Stop Redis container"
-	@echo "    make redis-cli   - Open Redis CLI"
+	@echo "    make redis-start    - Start Redis container"
+	@echo "    make redis-stop     - Stop Redis container"
+	@echo "    make redis-cli      - Open Redis CLI"
 	@echo ""
 	@echo "  Misc:"
-	@echo "    make clean      - Clean build artifacts"
-	@echo "    make deps       - Download dependencies"
-	@echo "    make fmt        - Format code"
-	@echo "    make lint       - Lint code"
-	@echo "    make token      - Generate test JWT token"
+	@echo "    make clean          - Clean build artifacts"
+	@echo "    make deps           - Download dependencies"
+	@echo "    make fmt            - Format code"
+	@echo "    make lint           - Lint code"
+	@echo "    make token          - Generate test JWT token"
+	@echo ""
+	@echo "  Environment Variables:"
+	@echo "    ENV=development|production  - Set environment (default: development)"
 
+ (ENVIRONMENT=production)"
+	@echo "    make stop           - Stop all services"
+	@echo "    make status         - Check service status"
+	@echo "    make dev            - Run with hot-reload (requires air)"
+	@echo ""
+	@echo "  Testing:"
+	@echo "    make test           - Run tests"
+	@echo "    make test-cover     - Run tests with coverage"
+	@echo "    make demo           - Run interactive demo"
+	@echo ""
+	@echo "  Docker:"
+	@echo "    make docker-up      - Start with docker-compose"
+	@echo "    make docker-down    - Stop docker-compose"
+	@echo "    make docker-logs    - View docker logs"
+	@echo "    make docker-build   - Build docker images"
+	@echo "    make docker-prod    - Start in production mode (ENVIRONMENT=production)"
+	@echo ""
+	@echo "  Redis:"
+	@echo "    make redis-start    - Start Redis container"
+	@echo "    make redis-stop     - Stop Redis container"
+	@echo "    make redis-cli      - Open Redis CLI"
+	@echo ""
+	@echo "  Misc:"
+	@echo "    make clean          - Clean build artifacts"
+	@echo "    make deps           - Download dependencies"
+	@echo "    make fmt            - Format code"
+	@echo "    make lint           - Lint code"
+	@echo "    make token          - Generate test JWT token"
+	@echo ""
+	@echo "  Environment:"
+	@echo "    Set ENVIRONMENT=development|production to control runtime mode"
+	@echo "    Config is validated at startup based on ENVIRONMENT value

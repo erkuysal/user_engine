@@ -1,8 +1,9 @@
 # UserEngine - Start All Services (PowerShell)
-# Usage: .\scripts\Start.ps1 [-Build]
+# Usage: .\scripts\Start.ps1 [-Build] [-Production]
 
 param(
-    [switch]$Build
+    [switch]$Build,
+    [switch]$Production
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,17 +13,68 @@ $ProjectDir = Split-Path -Parent $ScriptDir
 $BinDir = Join-Path $ProjectDir "bin"
 $LogDir = Join-Path $ProjectDir "logs"
 
-# Configuration
+# Set environment mode
+if ($Production) {
+    $env:ENVIRONMENT = "production"
+    Write-Host "Running in PRODUCTION mode" -ForegroundColor Red
+} else {
+    $env:ENVIRONMENT = if ($env:ENVIRONMENT) { $env:ENVIRONMENT } else { "development" }
+    Write-Host "Running in $($env:ENVIRONMENT) mode" -ForegroundColor Green
+}
+
+# Load .env file if exists
+$EnvFile = Join-Path $ProjectDir ".env"
+if (Test-Path $EnvFile) {
+    Write-Host "Loading configuration from .env" -ForegroundColor Cyan
+    Get-Content $EnvFile | ForEach-Object {
+        if ($_ -match '^\s*([^#][^=]+)=(.*)$') {
+            $key = $matches[1].Trim()
+            $value = $matches[2].Trim()
+            # Don't override ENVIRONMENT if already set
+            if ($key -ne "ENVIRONMENT" -or -not $env:ENVIRONMENT) {
+                [Environment]::SetEnvironmentVariable($key, $value, "Process")
+            }
+        }
+    }
+}
+
+# Fallback to defaults if not set
 $env:REDIS_ADDR = if ($env:REDIS_ADDR) { $env:REDIS_ADDR } else { "localhost:6379" }
 $env:JWT_SECRET = if ($env:JWT_SECRET) { $env:JWT_SECRET } else { "dev-secret-change-in-production" }
 $env:GATEWAY_ADDR = if ($env:GATEWAY_ADDR) { $env:GATEWAY_ADDR } else { ":8080" }
 $env:API_ADDR = if ($env:API_ADDR) { $env:API_ADDR } else { ":8081" }
+
+# Validate production configuration
+if ($env:ENVIRONMENT -eq 'production') {
+    Write-Host "Validating production configuration..." -ForegroundColor Yellow
+    
+    if ($env:JWT_SECRET -like "dev-secret*") {
+        Write-Host "❌ Error: JWT_SECRET must be changed for production" -ForegroundColor Red
+        Write-Host "   Set a secure JWT_SECRET in your .env file" -ForegroundColor Yellow
+        exit 1
+    }
+    
+    if ($env:CORS_ALLOW_ALL -eq "true") {
+        Write-Host "❌ Error: CORS_ALLOW_ALL=true is not allowed in production" -ForegroundColor Red
+        exit 1
+    }
+    
+    if (-not $env:CORS_ALLOWED_ORIGINS) {
+        Write-Host "❌ Error: CORS_ALLOWED_ORIGINS must be set in production" -ForegroundColor Red
+        exit 1
+    }
+    
+    Write-Host "✓ Production configuration is valid" -ForegroundColor Green
+}
 
 function Write-Banner {
     Write-Host ""
     Write-Host "╔═══════════════════════════════════════════╗" -ForegroundColor Cyan
     Write-Host "║         UserEngine Presence Engine        ║" -ForegroundColor Cyan
     Write-Host "╚═══════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Environment: " -NoNewline -ForegroundColor Yellow
+    Write-Host $env:ENVIRONMENT -ForegroundColor $(if ($env:ENVIRONMENT -eq 'production') { 'Red' } else { 'Green' })
     Write-Host ""
 }
 

@@ -33,6 +33,9 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		log.Fatal().Err(err).Msg("configuration validation failed")
 	}
+
+	// Show environment banner
+	log.Info().Msgf("🚀 Gateway starting in [%s] mode", cfg.Environment)
 	log.Info().Str("addr", cfg.GatewayAddr).Str("env", cfg.Environment).Msg("starting gateway")
 
 	// Connect to Redis
