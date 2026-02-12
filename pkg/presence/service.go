@@ -472,6 +472,13 @@ func (s *Service) IsUserOnline(ctx context.Context, scopeID, userID string) (boo
 	return s.rdb.SIsMember(ctx, key, userID).Result()
 }
 
+// GetOnlineUsersCount returns the total count of online users in a scope.
+// Uses Redis SCARD for O(1) performance.
+func (s *Service) GetOnlineUsersCount(ctx context.Context, scopeID string) (int64, error) {
+	key := s.keys.OnlineUsers(scopeID)
+	return s.rdb.SCard(ctx, key).Result()
+}
+
 // GetUserVersion returns the current version for a user.
 func (s *Service) GetUserVersion(ctx context.Context, scopeID, userID string) (int64, error) {
 	key := s.keys.UserVersion(scopeID, userID)

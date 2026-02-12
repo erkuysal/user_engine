@@ -72,6 +72,11 @@ func main() {
 		handleGetOnline(w, r, presenceSvc, authValidator)
 	})
 
+	// GET /presence/count - O(1) online user count
+	mux.HandleFunc("GET /presence/count", func(w http.ResponseWriter, r *http.Request) {
+		handleCount(w, r, presenceSvc, authValidator)
+	})
+
 	// POST /presence/lookup - Primary UI endpoint
 	mux.HandleFunc("POST /presence/lookup", func(w http.ResponseWriter, r *http.Request) {
 		handleLookup(w, r, presenceSvc, authValidator)
@@ -169,6 +174,39 @@ func handleGetOnline(w http.ResponseWriter, r *http.Request, svc *presence.Servi
 	json.NewEncoder(w).Encode(map[string]any{
 		"users":  users,
 		"cursor": nextCursor,
+	})
+}
+
+func handleCount(w http.ResponseWriter, r *http.Request, svc *presence.Service, authValidator *auth.Validator) {
+	// Extract and validate JWT
+	claims, err := authValidator.ValidateRequest(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	scopeID := r.URL.Query().Get("scope_id")
+	if scopeID == "" {
+		http.Error(w, "scope_id required", http.StatusBadRequest)
+		return
+	}
+
+	// Verify scope access
+	if !claims.HasScopeAccess(scopeID) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	count, err := svc.GetOnlineUsersCount(r.Context(), scopeID)
+	if err != nil {
+		log.Error().Err(err).Str("scope_id", scopeID).Msg("failed to get online users count")
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"count": count,
 	})
 }
 

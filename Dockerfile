@@ -51,7 +51,6 @@ USER userengine
 
 # Environment defaults
 ENV REDIS_ADDR=localhost:6379 \
-    JWT_SECRET=change-me-in-production \
     LUA_SCRIPTS_PATH=/app/lua
 
 # Health check
