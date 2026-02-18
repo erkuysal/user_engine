@@ -51,13 +51,17 @@ func TestConfigLoadFromEnvVars(t *testing.T) {
 	// Set custom env vars
 	os.Setenv("ENVIRONMENT", "production")
 	os.Setenv("REDIS_ADDR", "redis.example.com:6379")
-	os.Setenv("JWT_SECRET", "my-secret")
+	os.Setenv("JWT_SECRET", "my-secret-with-sufficient-length-32-chars")
 	os.Setenv("SESSION_TTL", "60s")
+	os.Setenv("CORS_ALLOWED_ORIGINS", "https://example.com")
+	os.Setenv("WEBHOOK_ENABLED", "false")
 	defer func() {
 		os.Unsetenv("ENVIRONMENT")
 		os.Unsetenv("REDIS_ADDR")
 		os.Unsetenv("JWT_SECRET")
 		os.Unsetenv("SESSION_TTL")
+		os.Unsetenv("CORS_ALLOWED_ORIGINS")
+		os.Unsetenv("WEBHOOK_ENABLED")
 	}()
 
 	cfg := config.Load()
@@ -68,8 +72,8 @@ func TestConfigLoadFromEnvVars(t *testing.T) {
 	if cfg.RedisAddr != "redis.example.com:6379" {
 		t.Errorf("expected RedisAddr=redis.example.com:6379, got %s", cfg.RedisAddr)
 	}
-	if cfg.JWTSecret != "my-secret" {
-		t.Errorf("expected JWTSecret=my-secret, got %s", cfg.JWTSecret)
+	if cfg.JWTSecret != "my-secret-with-sufficient-length-32-chars" {
+		t.Errorf("expected JWTSecret override, got %s", cfg.JWTSecret)
 	}
 	if cfg.SessionTTL != 60*time.Second {
 		t.Errorf("expected SessionTTL=60s, got %s", cfg.SessionTTL)
@@ -136,6 +140,7 @@ func TestConfigValidate_Production(t *testing.T) {
 				Environment:             "production",
 				JWTSecret:               "dev-secret-test",
 				RedisAddr:               "localhost:6379",
+				WorkerHealthAddr:        ":8080",
 				CORSAllowAll:            false,
 				CORSAllowedOrigins:      []string{"https://example.com"},
 				PingPeriod:              54 * time.Second,
@@ -143,6 +148,9 @@ func TestConfigValidate_Production(t *testing.T) {
 				SessionTTL:              45 * time.Second,
 				HeartbeatInterval:       15 * time.Second,
 				DisconnectDebounceDelay: 5 * time.Second,
+				MaxMessageSize:          4096,
+				MaxPendingEvents:        100,
+				SlowConsumerBuffer:      100,
 			},
 			expectError: true,
 		},
@@ -152,6 +160,7 @@ func TestConfigValidate_Production(t *testing.T) {
 				Environment:             "production",
 				JWTSecret:               "",
 				RedisAddr:               "localhost:6379",
+				WorkerHealthAddr:        ":8080",
 				CORSAllowAll:            false,
 				CORSAllowedOrigins:      []string{"https://example.com"},
 				PingPeriod:              54 * time.Second,
@@ -159,6 +168,9 @@ func TestConfigValidate_Production(t *testing.T) {
 				SessionTTL:              45 * time.Second,
 				HeartbeatInterval:       15 * time.Second,
 				DisconnectDebounceDelay: 5 * time.Second,
+				MaxMessageSize:          4096,
+				MaxPendingEvents:        100,
+				SlowConsumerBuffer:      100,
 			},
 			expectError: true,
 		},
@@ -166,8 +178,9 @@ func TestConfigValidate_Production(t *testing.T) {
 			name: "CORS allow all in production",
 			cfg: &config.Config{
 				Environment:             "production",
-				JWTSecret:               "real-secret",
+				JWTSecret:               "real-production-secret-min-32-characters",
 				RedisAddr:               "localhost:6379",
+				WorkerHealthAddr:        ":8080",
 				CORSAllowAll:            true,
 				CORSAllowedOrigins:      []string{},
 				PingPeriod:              54 * time.Second,
@@ -175,6 +188,9 @@ func TestConfigValidate_Production(t *testing.T) {
 				SessionTTL:              45 * time.Second,
 				HeartbeatInterval:       15 * time.Second,
 				DisconnectDebounceDelay: 5 * time.Second,
+				MaxMessageSize:          4096,
+				MaxPendingEvents:        100,
+				SlowConsumerBuffer:      100,
 			},
 			expectError: true,
 		},
@@ -182,8 +198,9 @@ func TestConfigValidate_Production(t *testing.T) {
 			name: "no CORS origins in production",
 			cfg: &config.Config{
 				Environment:             "production",
-				JWTSecret:               "real-secret",
+				JWTSecret:               "real-production-secret-min-32-characters",
 				RedisAddr:               "localhost:6379",
+				WorkerHealthAddr:        ":8080",
 				CORSAllowAll:            false,
 				CORSAllowedOrigins:      []string{},
 				PingPeriod:              54 * time.Second,
@@ -191,6 +208,9 @@ func TestConfigValidate_Production(t *testing.T) {
 				SessionTTL:              45 * time.Second,
 				HeartbeatInterval:       15 * time.Second,
 				DisconnectDebounceDelay: 5 * time.Second,
+				MaxMessageSize:          4096,
+				MaxPendingEvents:        100,
+				SlowConsumerBuffer:      100,
 			},
 			expectError: true,
 		},
@@ -198,8 +218,9 @@ func TestConfigValidate_Production(t *testing.T) {
 			name: "valid production config",
 			cfg: &config.Config{
 				Environment:             "production",
-				JWTSecret:               "real-production-secret",
+				JWTSecret:               "real-production-secret-min-32-characters",
 				RedisAddr:               "localhost:6379",
+				WorkerHealthAddr:        ":8080",
 				CORSAllowAll:            false,
 				CORSAllowedOrigins:      []string{"https://example.com"},
 				PingPeriod:              54 * time.Second,
@@ -207,6 +228,9 @@ func TestConfigValidate_Production(t *testing.T) {
 				SessionTTL:              45 * time.Second,
 				HeartbeatInterval:       15 * time.Second,
 				DisconnectDebounceDelay: 5 * time.Second,
+				MaxMessageSize:          4096,
+				MaxPendingEvents:        100,
+				SlowConsumerBuffer:      100,
 			},
 			expectError: false,
 		},
@@ -236,11 +260,15 @@ func TestConfigValidate_TimingConstraints(t *testing.T) {
 			cfg: &config.Config{
 				Environment:             "development",
 				RedisAddr:               "localhost:6379",
+				WorkerHealthAddr:        ":8080",
 				PingPeriod:              60 * time.Second,
 				PongWait:                60 * time.Second,
 				SessionTTL:              45 * time.Second,
 				HeartbeatInterval:       15 * time.Second,
 				DisconnectDebounceDelay: 5 * time.Second,
+				MaxMessageSize:          4096,
+				MaxPendingEvents:        100,
+				SlowConsumerBuffer:      100,
 			},
 			expectError: true,
 		},
@@ -249,11 +277,15 @@ func TestConfigValidate_TimingConstraints(t *testing.T) {
 			cfg: &config.Config{
 				Environment:             "development",
 				RedisAddr:               "localhost:6379",
+				WorkerHealthAddr:        ":8080",
 				PingPeriod:              54 * time.Second,
 				PongWait:                60 * time.Second,
 				SessionTTL:              10 * time.Second,
 				HeartbeatInterval:       15 * time.Second,
 				DisconnectDebounceDelay: 5 * time.Second,
+				MaxMessageSize:          4096,
+				MaxPendingEvents:        100,
+				SlowConsumerBuffer:      100,
 			},
 			expectError: true,
 		},
@@ -262,11 +294,15 @@ func TestConfigValidate_TimingConstraints(t *testing.T) {
 			cfg: &config.Config{
 				Environment:             "development",
 				RedisAddr:               "localhost:6379",
+				WorkerHealthAddr:        ":8080",
 				PingPeriod:              54 * time.Second,
 				PongWait:                60 * time.Second,
 				SessionTTL:              45 * time.Second,
 				HeartbeatInterval:       15 * time.Second,
 				DisconnectDebounceDelay: 500 * time.Millisecond,
+				MaxMessageSize:          4096,
+				MaxPendingEvents:        100,
+				SlowConsumerBuffer:      100,
 			},
 			expectError: true,
 		},

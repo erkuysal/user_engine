@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/userengine/presence/pkg/auth"
@@ -44,6 +45,9 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	shutdown   chan struct{}
+
+	closing      atomic.Bool
+	shutdownOnce sync.Once
 }
 
 // NewHub creates a new WebSocket hub.
@@ -52,6 +56,9 @@ func NewHub(svc *presence.Service, eventBus events.EventBus, cfg *config.Config)
 		DisconnectDelay: cfg.DisconnectDebounceDelay,
 		JobTTL:          cfg.DebounceJobTTL,
 		PollInterval:    cfg.DebouncerPollInterval,
+		FlappingWindow:  cfg.FlappingWindow,
+		FlappingThreshold: cfg.FlappingThreshold,
+		OfflineDelay:    cfg.OfflineDelay,
 	})
 
 	// Build allowed origins map for O(1) lookup
@@ -68,8 +75,8 @@ func NewHub(svc *presence.Service, eventBus events.EventBus, cfg *config.Config)
 		debouncer:     debouncer,
 		connections:   make(map[string]map[*Client]struct{}),
 		subscriptions: make(map[string]func()),
-		register:      make(chan *Client),
-		unregister:    make(chan *Client),
+		register:      make(chan *Client, maxInt(1, cfg.MaxPendingEvents)),
+		unregister:    make(chan *Client, maxInt(1, cfg.MaxPendingEvents)),
 		shutdown:      make(chan struct{}),
 	}
 
@@ -159,26 +166,44 @@ func (h *Hub) Run(ctx context.Context) {
 
 // Shutdown gracefully shuts down the hub.
 func (h *Hub) Shutdown() {
-	close(h.shutdown)
+	if !h.closing.CompareAndSwap(false, true) {
+		return
+	}
+
+	var cancels []func()
+	var clients []*Client
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// Cancel all subscriptions
 	for _, cancel := range h.subscriptions {
-		cancel()
+		cancels = append(cancels, cancel)
 	}
-
-	// Close all connections
-	for _, clients := range h.connections {
-		for client := range clients {
-			client.Close()
+	for _, scopeClients := range h.connections {
+		for client := range scopeClients {
+			clients = append(clients, client)
 		}
 	}
+	// Clear maps to prevent further broadcasts/subscription management.
+	h.subscriptions = make(map[string]func())
+	h.connections = make(map[string]map[*Client]struct{})
+	h.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, client := range clients {
+		client.Close()
+	}
+
+	h.shutdownOnce.Do(func() { close(h.shutdown) })
 }
 
 // HandleWebSocket handles WebSocket upgrade and connection setup.
 func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if h.closing.Load() {
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
 	// Validate JWT
 	claims, err := h.validator.ValidateRequest(r)
 	if err != nil {
@@ -205,6 +230,22 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce per-user connection cap per scope (pre-upgrade).
+	if h.cfg.MaxConnsPerUser > 0 {
+		h.mu.RLock()
+		existing := 0
+		for c := range h.connections[scopeID] {
+			if c.userID == claims.UserID {
+				existing++
+			}
+		}
+		h.mu.RUnlock()
+		if existing >= h.cfg.MaxConnsPerUser {
+			http.Error(w, "too many connections", http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	// Upgrade connection
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -217,7 +258,17 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	client := NewClient(h, conn, claims.UserID, sessionID, scopeID, deviceID, deviceType, invisible, h.cfg)
 
 	// Register
-	h.register <- client
+	select {
+	case h.register <- client:
+	case <-h.shutdown:
+		client.Close()
+		return
+	default:
+		// Hub overloaded; fail fast rather than blocking upgrade handler.
+		client.Close()
+		http.Error(w, "server busy", http.StatusServiceUnavailable)
+		return
+	}
 
 	// Start client goroutines
 	go client.WritePump()
@@ -225,6 +276,11 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Hub) addClient(ctx context.Context, client *Client) {
+	if h.closing.Load() {
+		client.Close()
+		return
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -301,11 +357,7 @@ func (h *Hub) startSubscription(ctx context.Context, scopeID string) {
 }
 
 func (h *Hub) broadcastToScope(scopeID string, event events.PresenceEvent) {
-	h.mu.RLock()
-	clients := h.connections[scopeID]
-	h.mu.RUnlock()
-
-	if len(clients) == 0 {
+	if h.closing.Load() {
 		return
 	}
 
@@ -318,8 +370,20 @@ func (h *Hub) broadcastToScope(scopeID string, event events.PresenceEvent) {
 	// Record event consumption
 	metrics.Global().IncEventConsumed(event.Type)
 
+	h.mu.RLock()
+	clientsMap := h.connections[scopeID]
+	if len(clientsMap) == 0 {
+		h.mu.RUnlock()
+		return
+	}
+	clients := make([]*Client, 0, len(clientsMap))
+	for client := range clientsMap {
+		clients = append(clients, client)
+	}
+	h.mu.RUnlock()
+
 	sentCount := 0
-	for client := range clients {
+	for _, client := range clients {
 		// Filter: Only send event if:
 		// 1. It's about the client's own user (always deliver own events)
 		// 2. The client has subscribed to this user's presence
@@ -330,17 +394,14 @@ func (h *Hub) broadcastToScope(scopeID string, event events.PresenceEvent) {
 			continue // Skip - client didn't subscribe to this user
 		}
 
-		select {
-		case client.send <- data:
+		if client.TrySend(data) {
 			sentCount++
-		default:
+		} else {
 			// Slow consumer, drop event
 			metrics.Global().IncEventDropped()
-			log.Warn().
-				Str("scope_id", scopeID).
-				Str("user_id", client.userID).
-				Str("session_id", client.sessionID).
-				Msg("dropping event for slow consumer")
+			if h.cfg.DisconnectSlowConsumers {
+				client.Close()
+			}
 		}
 	}
 
@@ -365,7 +426,21 @@ func (h *Hub) Debouncer() *presence.Debouncer {
 
 // Unregister removes a client from the hub.
 func (h *Hub) Unregister(client *Client) {
-	h.unregister <- client
+	if h.closing.Load() {
+		return
+	}
+	select {
+	case h.unregister <- client:
+	case <-h.shutdown:
+		return
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // HeartbeatRateLimit returns the minimum time between heartbeats.

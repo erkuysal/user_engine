@@ -2,7 +2,6 @@ package presence
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"time"
 
@@ -75,7 +74,7 @@ func NewDebouncer(svc *Service, eventBus events.Publisher, cfg DebouncerConfig) 
 		eventBus: eventBus,
 		rdb:      svc.Redis(),
 		cfg:      cfg,
-		keys:     Key{},
+		keys:     svc.Keys(),
 	}
 }
 
@@ -245,18 +244,13 @@ func (d *Debouncer) processScope(ctx context.Context, scopeID string) error {
 	return nil
 }
 
-// transitionKey returns the Redis key for tracking user transitions (for flapping detection).
-func (d *Debouncer) transitionKey(scopeID, userID string) string {
-	return fmt.Sprintf("presence:transitions:%s:%s", scopeID, userID)
-}
-
 // recordTransition records a transition and returns true if the user is flapping.
 func (d *Debouncer) recordTransition(ctx context.Context, scopeID, userID string) (bool, error) {
 	if d.cfg.FlappingThreshold <= 0 || d.cfg.FlappingWindow <= 0 {
 		return false, nil // Flapping detection disabled
 	}
 
-	key := d.transitionKey(scopeID, userID)
+	key := d.keys.Transitions(scopeID, userID)
 	now := time.Now().UnixMilli()
 	windowStart := now - d.cfg.FlappingWindow.Milliseconds()
 
@@ -265,7 +259,7 @@ func (d *Debouncer) recordTransition(ctx context.Context, scopeID, userID string
 	// Add current transition timestamp
 	pipe.ZAdd(ctx, key, &redis.Z{
 		Score:  float64(now),
-		Member: strconv.FormatInt(now, 10),
+		Member: uuid.New().String(),
 	})
 
 	// Remove old entries outside the window
@@ -304,7 +298,7 @@ func (d *Debouncer) isUserFlapping(ctx context.Context, scopeID, userID string) 
 		return false, nil
 	}
 
-	key := d.transitionKey(scopeID, userID)
+	key := d.keys.Transitions(scopeID, userID)
 	now := time.Now().UnixMilli()
 	windowStart := now - d.cfg.FlappingWindow.Milliseconds()
 

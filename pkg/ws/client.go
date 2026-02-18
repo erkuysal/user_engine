@@ -33,6 +33,7 @@ type Client struct {
 	lastHeartbeat time.Time
 	mu            sync.Mutex
 	normalClose   bool
+	connected     bool
 
 	// subscribedUsers holds user IDs this client wants presence events for (friend subscriptions)
 	subscribedUsers map[string]struct{}
@@ -51,11 +52,6 @@ type SubscribeFriendsPayload struct {
 
 // NewClient creates a new WebSocket client.
 func NewClient(hub *Hub, conn *websocket.Conn, userID, sessionID, scopeID, deviceID, deviceType string, invisible bool, cfg *config.Config) *Client {
-	log.Debug().
-		Str("session_id", sessionID).
-		Str("device_type", deviceType).
-		Bool("invisible", invisible).
-		Msg("NewClient created")
 	return &Client{
 		hub:        hub,
 		conn:       conn,
@@ -93,23 +89,21 @@ func (c *Client) ReadPump() {
 			Msg("initial connect failed")
 		return
 	}
+	c.mu.Lock()
+	c.connected = true
+	c.mu.Unlock()
 
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			// DEBUG: Extensive closing logic logging
 			isNormal := false
 			if ce, ok := err.(*websocket.CloseError); ok {
-				log.Info().Int("code", ce.Code).Str("text", ce.Text).Msg("WebSocket closed via CloseError")
 				if ce.Code == 1000 || ce.Code == websocket.CloseNormalClosure || ce.Code == 1001 || ce.Code == websocket.CloseGoingAway {
 					isNormal = true
 				}
-			} else {
-				log.Info().Err(err).Msg("WebSocket read error (not CloseError)")
 			}
 
 			if isNormal {
-				log.Error().Msg("!!! DETECTED NORMAL CLOSE (1000) - TRIGGERING IMMEDIATE DISCONNECT !!!")
 				c.mu.Lock()
 				c.normalClose = true
 				c.mu.Unlock()
@@ -140,71 +134,28 @@ func (c *Client) ReadPump() {
 
 func (c *Client) scheduleDisconnect() {
 	c.mu.Lock()
-	isNormalClose := c.normalClose
+	connected := c.connected
 	c.mu.Unlock()
 
-	ctx := context.Background()
-	log.Info().Bool("normal_close", isNormalClose).Str("session_id", c.sessionID).Msg("scheduleDisconnect called")
-
-	// If closed normally (logout), disconnect immediately without debounce
-	if isNormalClose {
-		log.Info().
-			Str("session_id", c.sessionID).
-			Str("user_id", c.userID).
-			Msg("immediate disconnect (normal close)")
-
-		svc := c.hub.PresenceService()
-		result, err := svc.Disconnect(ctx, c.scopeID, c.sessionID, c.userID)
-		if err != nil {
-			log.Error().Err(err).
-				Str("session_id", c.sessionID).
-				Msg("failed to disconnect session")
-			return
-		}
-
-		if result.Transition == "offline" {
-			event := events.PresenceEvent{
-				EventID:    events.NewEventID(),
-				ScopeID:    c.scopeID,
-				Type:       events.EventTypeUserOffline,
-				UserID:     c.userID,
-				Version:    result.Version,
-				TabCount:   result.SessionCount,
-				OccurredAt: time.Now().UTC(),
-				Source:     "gateway",
-				DeviceID:   c.deviceID,
-			}
-
-			if err := c.hub.EventBus.Publish(ctx, c.scopeID, event); err != nil {
-				log.Error().Err(err).Msg("failed to publish offline event")
-			}
-		} else if result.SessionCount > 0 {
-			event := events.PresenceEvent{
-				EventID:    events.NewEventID(),
-				ScopeID:    c.scopeID,
-				Type:       events.EventTypeUserTabs,
-				UserID:     c.userID,
-				Version:    result.Version,
-				TabCount:   result.SessionCount,
-				OccurredAt: time.Now().UTC(),
-				Source:     "gateway",
-				DeviceID:   c.deviceID,
-			}
-
-			if err := c.hub.EventBus.Publish(ctx, c.scopeID, event); err != nil {
-				log.Error().Err(err).Msg("failed to publish tab count event")
-			}
-		}
+	// If we never connected successfully, don't schedule disconnect work.
+	if !connected {
 		return
 	}
 
-	// Abnormal close: schedule debounce
+	c.mu.Lock()
+	isNormalClose := c.normalClose
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	debouncer := c.hub.Debouncer()
 
 	_, err := debouncer.ScheduleDisconnect(ctx, c.scopeID, c.userID, c.sessionID)
 	if err != nil {
 		log.Error().Err(err).
 			Str("session_id", c.sessionID).
+			Bool("normal_close", isNormalClose).
 			Msg("failed to schedule disconnect")
 	}
 }
@@ -222,13 +173,8 @@ func (c *Client) WritePump() {
 		case <-c.done:
 			return
 
-		case message, ok := <-c.send:
+		case message := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(c.cfg.WriteTimeout))
-			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
@@ -246,7 +192,7 @@ func (c *Client) WritePump() {
 func (c *Client) Close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
-		close(c.send)
+		_ = c.conn.Close()
 	})
 }
 
@@ -358,16 +304,6 @@ func (c *Client) handleHeartbeat() {
 	timeSinceLast := now.Sub(lastHB)
 	c.mu.Unlock()
 
-	// DEBUG: Log every heartbeat attempt with detailed timing
-	log.Info().
-		Str("session_id", c.sessionID).
-		Str("user_id", c.userID).
-		Dur("since_last_hb", timeSinceLast).
-		Time("last_hb_at", lastHB).
-		Time("now", now).
-		Dur("rate_limit", c.hub.HeartbeatRateLimit()).
-		Msg("[DEBUG] heartbeat received from client")
-
 	// Rate limit heartbeats
 	if timeSinceLast < c.hub.HeartbeatRateLimit() {
 		metrics.Global().IncHeartbeat(false) // rejected
@@ -376,17 +312,12 @@ func (c *Client) handleHeartbeat() {
 			Str("user_id", c.userID).
 			Dur("since_last", timeSinceLast).
 			Dur("rate_limit", c.hub.HeartbeatRateLimit()).
-			Msg("[DEBUG] heartbeat REJECTED - rate limited")
+			Msg("heartbeat rejected (rate limited)")
 		return
 	}
 
 	ctx := context.Background()
 	svc := c.hub.PresenceService()
-
-	log.Debug().
-		Str("session_id", c.sessionID).
-		Str("scope_id", c.scopeID).
-		Msg("[DEBUG] calling svc.Heartbeat to refresh session TTL")
 
 	err := svc.Heartbeat(ctx, c.scopeID, c.sessionID)
 	if err != nil {
@@ -397,7 +328,7 @@ func (c *Client) handleHeartbeat() {
 				Str("session_id", c.sessionID).
 				Str("user_id", c.userID).
 				Dur("since_last_hb", timeSinceLast).
-				Msg("[DEBUG] SESSION EXPIRED - heartbeat found no session in Redis! Sending reconnect_required")
+				Msg("session expired; reconnect required")
 			c.sendReconnectRequired("session_expired")
 			c.conn.WriteControl(
 				websocket.CloseMessage,
@@ -411,7 +342,7 @@ func (c *Client) handleHeartbeat() {
 			Err(err).
 			Str("session_id", c.sessionID).
 			Str("user_id", c.userID).
-			Msg("[DEBUG] heartbeat Redis operation failed")
+			Msg("heartbeat failed")
 		return
 	}
 
@@ -421,11 +352,11 @@ func (c *Client) handleHeartbeat() {
 	c.lastHeartbeat = time.Now()
 	c.mu.Unlock()
 
-	log.Info().
+	log.Debug().
 		Str("session_id", c.sessionID).
 		Str("user_id", c.userID).
 		Dur("interval", timeSinceLast).
-		Msg("[DEBUG] heartbeat OK - session TTL refreshed")
+		Msg("heartbeat ok")
 }
 
 func (c *Client) sendReconnectRequired(reason string) {
@@ -459,9 +390,8 @@ func (c *Client) handleSubscribeFriends(payload json.RawMessage) {
 	}
 
 	// Limit subscriptions to prevent abuse
-	const maxSubscriptions = 1000
-	if len(sub.UserIDs) > maxSubscriptions {
-		sub.UserIDs = sub.UserIDs[:maxSubscriptions]
+	if c.cfg.MaxFriendSubscriptions > 0 && len(sub.UserIDs) > c.cfg.MaxFriendSubscriptions {
+		sub.UserIDs = sub.UserIDs[:c.cfg.MaxFriendSubscriptions]
 	}
 
 	c.mu.Lock()
@@ -486,4 +416,21 @@ func (c *Client) IsSubscribedTo(userID string) bool {
 	defer c.mu.Unlock()
 	_, ok := c.subscribedUsers[userID]
 	return ok
+}
+
+// TrySend attempts to enqueue a message to this client without blocking.
+// Returns true if enqueued, false if the client is closed or backpressured.
+func (c *Client) TrySend(data []byte) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+
+	select {
+	case c.send <- data:
+		return true
+	default:
+		return false
+	}
 }

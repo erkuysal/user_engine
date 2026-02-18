@@ -43,6 +43,7 @@ func baseConfig() *Config {
 		// Service addresses
 		GatewayAddr: getEnv("GATEWAY_ADDR", ":8080"),
 		APIAddr:     getEnv("API_ADDR", ":8081"),
+		WorkerHealthAddr: getEnv("WORKER_HEALTH_ADDR", ":8080"),
 
 		// Webhooks - common settings
 		WebhookStreamName:    getEnv("WEBHOOK_STREAM_NAME", "presence:webhooks"),
@@ -63,6 +64,8 @@ func baseConfig() *Config {
 		PongWait:       getEnvDuration("PONG_WAIT", 60*time.Second),
 		PingPeriod:     getEnvDuration("PING_PERIOD", 54*time.Second),
 		MaxMessageSize: int64(getEnvInt("MAX_MESSAGE_SIZE", 4096)),
+		DisconnectSlowConsumers: getEnvBool("DISCONNECT_SLOW_CONSUMERS", false),
+		MaxFriendSubscriptions:  getEnvInt("MAX_FRIEND_SUBSCRIPTIONS", 1000),
 	}
 }
 

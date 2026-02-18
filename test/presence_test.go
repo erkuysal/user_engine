@@ -161,6 +161,17 @@ func TestKey_UserDevices(t *testing.T) {
 	}
 }
 
+func TestKey_Transitions(t *testing.T) {
+	k := presence.NewKey(true)
+	got := k.Transitions("scope1", "user1")
+	if !strings.Contains(got, "{scope1:user1}") {
+		t.Errorf("Transitions() = %q, want to contain {scope1:user1}", got)
+	}
+	if !strings.Contains(got, "presence:transitions:") {
+		t.Errorf("Transitions() = %q, want to contain presence:transitions:", got)
+	}
+}
+
 func TestNewKey(t *testing.T) {
 	k := presence.NewKey(true)
 	if !k.UseHashTags {

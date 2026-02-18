@@ -2,61 +2,42 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
+	"github.com/userengine/presence/pkg/app"
 	"github.com/userengine/presence/pkg/auth"
 	"github.com/userengine/presence/pkg/config"
 	"github.com/userengine/presence/pkg/events"
-	"github.com/userengine/presence/pkg/health"
-	"github.com/userengine/presence/pkg/metrics"
+	"github.com/userengine/presence/pkg/httpx"
 	"github.com/userengine/presence/pkg/presence"
 
-	"github.com/go-redis/redis/v8"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
 const version = "1.0.0"
 
 func main() {
-	// Setup logging
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	app.SetupLogging()
 
 	// Load and validate config
 	cfg := config.Load()
-	if err := cfg.Validate(); err != nil {
-		log.Fatal().Err(err).Msg("configuration validation failed")
-	}
 
 	// Show environment banner
 	log.Info().Msgf("🚀 API starting in [%s] mode", cfg.Environment)
 	log.Info().Str("addr", cfg.APIAddr).Str("env", cfg.Environment).Msg("starting api")
 
+	ctx, stop := app.SignalContext(context.Background())
+	defer stop()
+
 	// Connect to Redis
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPassword,
-		DB:       cfg.RedisDB,
-	})
+	rdb := app.NewRedisClient(cfg)
 	defer rdb.Close()
 
-	ctx := context.Background()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatal().Err(err).Msg("failed to connect to redis")
-	}
+	app.MustPingRedis(ctx, rdb)
 
 	// Initialize presence service
-	presenceSvc := presence.NewService(rdb)
-	presenceSvc.SetUseHashTags(cfg.RedisClusterEnabled) // Enable hash tags for cluster mode
-	if err := presenceSvc.LoadScripts(ctx); err != nil {
-		log.Fatal().Err(err).Msg("failed to load lua scripts")
-	}
+	presenceSvc := app.MustNewPresenceService(ctx, rdb, cfg)
 
 	// Initialize event bus (for server-side disconnect events)
 	eventBus := events.NewRedisPubSub(rdb)
@@ -97,22 +78,8 @@ func main() {
 		handleDevices(w, r, presenceSvc, authValidator)
 	})
 
-	// Initialize health checker
-	healthChecker := health.NewChecker(rdb, presenceSvc, version)
-
-	// Health check endpoints
-	mux.Handle("/health", healthChecker.Handler())
-	mux.Handle("/livez", health.LivenessHandler())
-	mux.Handle("/readyz", health.ReadinessHandler(rdb))
-
-	// Prometheus metrics endpoint
-	mux.Handle("/metrics", metrics.Global().Handler())
-
-	// JSON metrics endpoint for debugging
-	mux.HandleFunc("/metrics/json", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(metrics.Global().Snapshot())
-	})
+	// Standard health + metrics endpoints
+	app.AddDiagnosticsEndpoints(mux, rdb, presenceSvc, version)
 
 	server := &http.Server{
 		Addr:         cfg.APIAddr,
@@ -121,40 +88,32 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	// Graceful shutdown
 	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
+		<-ctx.Done()
 		log.Info().Msg("shutting down api")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		server.Shutdown(shutdownCtx)
 	}()
 
 	log.Info().Str("addr", cfg.APIAddr).Msg("api listening")
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+	if err := app.ListenAndServeWithShutdown(ctx, server, 10*time.Second); err != nil {
 		log.Fatal().Err(err).Msg("server error")
 	}
 }
 
 func handleGetOnline(w http.ResponseWriter, r *http.Request, svc *presence.Service, authValidator *auth.Validator) {
 	// Extract and validate JWT
-	claims, err := authValidator.ValidateRequest(r)
-	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	claims, ok := requireAuth(w, r, authValidator)
+	if !ok {
 		return
 	}
 
 	scopeID := r.URL.Query().Get("scope_id")
 	if scopeID == "" {
-		http.Error(w, "scope_id required", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "scope_id required")
 		return
 	}
 
 	// Verify scope access
-	if !claims.HasScopeAccess(scopeID) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if !requireScopeAccess(w, claims, scopeID) {
 		return
 	}
 
@@ -166,12 +125,11 @@ func handleGetOnline(w http.ResponseWriter, r *http.Request, svc *presence.Servi
 	users, nextCursor, err := svc.GetOnlineUsers(r.Context(), scopeID, cursor, 100)
 	if err != nil {
 		log.Error().Err(err).Str("scope_id", scopeID).Msg("failed to get online users")
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"users":  users,
 		"cursor": nextCursor,
 	})
@@ -179,33 +137,30 @@ func handleGetOnline(w http.ResponseWriter, r *http.Request, svc *presence.Servi
 
 func handleCount(w http.ResponseWriter, r *http.Request, svc *presence.Service, authValidator *auth.Validator) {
 	// Extract and validate JWT
-	claims, err := authValidator.ValidateRequest(r)
-	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	claims, ok := requireAuth(w, r, authValidator)
+	if !ok {
 		return
 	}
 
 	scopeID := r.URL.Query().Get("scope_id")
 	if scopeID == "" {
-		http.Error(w, "scope_id required", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "scope_id required")
 		return
 	}
 
 	// Verify scope access
-	if !claims.HasScopeAccess(scopeID) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if !requireScopeAccess(w, claims, scopeID) {
 		return
 	}
 
 	count, err := svc.GetOnlineUsersCount(r.Context(), scopeID)
 	if err != nil {
 		log.Error().Err(err).Str("scope_id", scopeID).Msg("failed to get online users count")
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"count": count,
 	})
 }
@@ -217,48 +172,45 @@ type lookupRequest struct {
 
 func handleLookup(w http.ResponseWriter, r *http.Request, svc *presence.Service, authValidator *auth.Validator) {
 	// Extract and validate JWT
-	claims, err := authValidator.ValidateRequest(r)
-	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	claims, ok := requireAuth(w, r, authValidator)
+	if !ok {
 		return
 	}
 
 	var req lookupRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 
 	if req.ScopeID == "" {
-		http.Error(w, "scope_id required", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "scope_id required")
 		return
 	}
 
 	if len(req.UserIDs) == 0 {
-		http.Error(w, "user_ids required", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "user_ids required")
 		return
 	}
 
 	if len(req.UserIDs) > 1000 {
-		http.Error(w, "too many user_ids (max 1000)", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "too many user_ids (max 1000)")
 		return
 	}
 
 	// Verify scope access
-	if !claims.HasScopeAccess(req.ScopeID) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if !requireScopeAccess(w, claims, req.ScopeID) {
 		return
 	}
 
 	statuses, err := svc.LookupUsers(r.Context(), req.ScopeID, req.UserIDs)
 	if err != nil {
 		log.Error().Err(err).Str("scope_id", req.ScopeID).Msg("failed to lookup users")
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"statuses": statuses,
 	})
 }
@@ -269,47 +221,44 @@ type tabsRequest struct {
 }
 
 func handleTabs(w http.ResponseWriter, r *http.Request, svc *presence.Service, authValidator *auth.Validator) {
-	claims, err := authValidator.ValidateRequest(r)
-	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	claims, ok := requireAuth(w, r, authValidator)
+	if !ok {
 		return
 	}
 
 	var req tabsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 
 	if req.ScopeID == "" {
-		http.Error(w, "scope_id required", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "scope_id required")
 		return
 	}
 
 	if len(req.UserIDs) == 0 {
-		http.Error(w, "user_ids required", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "user_ids required")
 		return
 	}
 
 	if len(req.UserIDs) > 1000 {
-		http.Error(w, "too many user_ids (max 1000)", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "too many user_ids (max 1000)")
 		return
 	}
 
-	if !claims.HasScopeAccess(req.ScopeID) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if !requireScopeAccess(w, claims, req.ScopeID) {
 		return
 	}
 
 	counts, err := svc.GetUsersSessionCounts(r.Context(), req.ScopeID, req.UserIDs)
 	if err != nil {
 		log.Error().Err(err).Str("scope_id", req.ScopeID).Msg("failed to get tab counts")
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"counts": counts,
 	})
 }
@@ -320,32 +269,30 @@ type disconnectUserRequest struct {
 }
 
 func handleDisconnectUser(w http.ResponseWriter, r *http.Request, svc *presence.Service, authValidator *auth.Validator, eventBus events.Publisher) {
-	claims, err := authValidator.ValidateRequest(r)
-	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	claims, ok := requireAuth(w, r, authValidator)
+	if !ok {
 		return
 	}
 
 	var req disconnectUserRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 
 	if req.ScopeID == "" || req.UserID == "" {
-		http.Error(w, "scope_id and user_id required", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "scope_id and user_id required")
 		return
 	}
 
-	if !claims.HasScopeAccess(req.ScopeID) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if !requireScopeAccess(w, claims, req.ScopeID) {
 		return
 	}
 
 	result, err := svc.DisconnectUser(r.Context(), req.ScopeID, req.UserID)
 	if err != nil {
 		log.Error().Err(err).Str("scope_id", req.ScopeID).Str("user_id", req.UserID).Msg("failed to disconnect user")
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -381,8 +328,7 @@ func handleDisconnectUser(w http.ResponseWriter, r *http.Request, svc *presence.
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"transition":    result.Transition,
 		"version":       result.Version,
 		"session_count": result.SessionCount,
@@ -395,47 +341,61 @@ type devicesRequest struct {
 }
 
 func handleDevices(w http.ResponseWriter, r *http.Request, svc *presence.Service, authValidator *auth.Validator) {
-	claims, err := authValidator.ValidateRequest(r)
-	if err != nil {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	claims, ok := requireAuth(w, r, authValidator)
+	if !ok {
 		return
 	}
 
 	var req devicesRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 
 	if req.ScopeID == "" {
-		http.Error(w, "scope_id required", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "scope_id required")
 		return
 	}
 
 	if len(req.UserIDs) == 0 {
-		http.Error(w, "user_ids required", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "user_ids required")
 		return
 	}
 
 	if len(req.UserIDs) > 1000 {
-		http.Error(w, "too many user_ids (max 1000)", http.StatusBadRequest)
+		httpx.WriteError(w, http.StatusBadRequest, "too many user_ids (max 1000)")
 		return
 	}
 
-	if !claims.HasScopeAccess(req.ScopeID) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if !requireScopeAccess(w, claims, req.ScopeID) {
 		return
 	}
 
 	devices, err := svc.GetUsersDevices(r.Context(), req.ScopeID, req.UserIDs)
 	if err != nil {
 		log.Error().Err(err).Str("scope_id", req.ScopeID).Msg("failed to get user devices")
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"devices": devices,
 	})
+}
+
+func requireAuth(w http.ResponseWriter, r *http.Request, v *auth.Validator) (*auth.Claims, bool) {
+	claims, err := v.ValidateRequest(r)
+	if err != nil {
+		httpx.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return nil, false
+	}
+	return claims, true
+}
+
+func requireScopeAccess(w http.ResponseWriter, claims *auth.Claims, scopeID string) bool {
+	if !claims.HasScopeAccess(scopeID) {
+		httpx.WriteError(w, http.StatusForbidden, "forbidden")
+		return false
+	}
+	return true
 }

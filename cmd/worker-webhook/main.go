@@ -2,25 +2,20 @@ package main
 
 import (
 	"context"
-	"os"
-	"os/signal"
-	"syscall"
+	"errors"
+	"net/http"
+	"time"
 
+	"github.com/userengine/presence/pkg/app"
 	"github.com/userengine/presence/pkg/config"
 	"github.com/userengine/presence/pkg/webhooks"
 
-	"net/http"
-
-	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
 func main() {
-	// Setup logging
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	app.SetupLogging()
 
 	// Load config
 	cfg := config.Load()
@@ -35,31 +30,29 @@ func main() {
 		Str("group", cfg.WebhookConsumerGroup).
 		Msg("starting webhook worker")
 
+	ctx, stop := app.SignalContext(context.Background())
+	defer stop()
+
 	// Start health check server
 	go func() {
-		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ok"))
-		})
-		log.Info().Msg("starting health check server on :8080")
-		if err := http.ListenAndServe(":8080", nil); err != nil {
-			log.Error().Err(err).Msg("health check server failed")
+		mux := http.NewServeMux()
+		app.AddWorkerHealthEndpoint(mux)
+		server := &http.Server{
+			Addr:              cfg.WorkerHealthAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		log.Info().Str("addr", cfg.WorkerHealthAddr).Msg("starting worker health server")
+		if err := app.ListenAndServeWithShutdown(ctx, server, 5*time.Second); err != nil {
+			log.Error().Err(err).Msg("worker health server failed")
 		}
 	}()
 
 	// Connect to Redis
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPassword,
-		DB:       cfg.RedisDB,
-	})
+	rdb := app.NewRedisClient(cfg)
 	defer rdb.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatal().Err(err).Msg("failed to connect to redis")
-	}
+	app.MustPingRedis(ctx, rdb)
 
 	// Generate unique consumer name
 	consumerName := "webhook-worker-" + uuid.New().String()[:8]
@@ -67,16 +60,7 @@ func main() {
 	// Create and run worker
 	worker := webhooks.NewWorker(rdb, cfg, consumerName)
 
-	// Handle shutdown
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		log.Info().Msg("shutting down webhook worker")
-		cancel()
-	}()
-
-	if err := worker.Run(ctx); err != nil && err != context.Canceled {
+	if err := worker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal().Err(err).Msg("webhook worker error")
 	}
 }

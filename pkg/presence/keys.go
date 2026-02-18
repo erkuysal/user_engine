@@ -127,3 +127,12 @@ func (k Key) UserDevices(scopeID, userID string) string {
 	tag := k.hashTag(scopeID + ":" + userID)
 	return fmt.Sprintf("presence:user_devices:%s", tag)
 }
+
+// Transitions returns the key for tracking presence transitions for a user.
+// Used for flapping detection.
+// Value: ZSET of timestamps within a time window.
+// Hash tag: {scope_id:user_id} for user-scoped operations (cluster friendly).
+func (k Key) Transitions(scopeID, userID string) string {
+	tag := k.hashTag(scopeID + ":" + userID)
+	return fmt.Sprintf("presence:transitions:%s", tag)
+}

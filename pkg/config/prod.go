@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/url"
 	"strings"
 	"time"
 )
@@ -91,6 +92,13 @@ func validateProduction(cfg *Config) error {
 		})
 	}
 
+	if len(cfg.JWTSecret) > 0 && len(cfg.JWTSecret) < 32 {
+		errors = append(errors, ValidationError{
+			Field:   "JWT_SECRET",
+			Message: "JWT_SECRET should be at least 32 characters in production",
+		})
+	}
+
 	// CORS validation
 	if cfg.CORSAllowAll {
 		errors = append(errors, ValidationError{
@@ -104,6 +112,35 @@ func validateProduction(cfg *Config) error {
 			Field:   "CORS_ALLOWED_ORIGINS",
 			Message: "CORS_ALLOWED_ORIGINS must be set in production",
 		})
+	}
+
+	for _, raw := range cfg.CORSAllowedOrigins {
+		origin := strings.TrimSpace(raw)
+		if origin == "" {
+			continue
+		}
+		if strings.Contains(origin, "*") {
+			errors = append(errors, ValidationError{
+				Field:   "CORS_ALLOWED_ORIGINS",
+				Message: "wildcard origins are not allowed in production (remove '*' entries)",
+			})
+			break
+		}
+		u, err := url.Parse(origin)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			errors = append(errors, ValidationError{
+				Field:   "CORS_ALLOWED_ORIGINS",
+				Message: "invalid origin in CORS_ALLOWED_ORIGINS: " + origin,
+			})
+			break
+		}
+		if u.Scheme != "https" && u.Scheme != "http" {
+			errors = append(errors, ValidationError{
+				Field:   "CORS_ALLOWED_ORIGINS",
+				Message: "CORS origin must be http or https: " + origin,
+			})
+			break
+		}
 	}
 
 	// Webhook validation

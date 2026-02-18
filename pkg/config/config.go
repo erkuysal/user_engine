@@ -23,6 +23,7 @@ type Config struct {
 	// Service addresses
 	GatewayAddr string
 	APIAddr     string
+	WorkerHealthAddr string
 
 	// JWT
 	JWTSecret string
@@ -58,6 +59,8 @@ type Config struct {
 	MaxMessageSize     int64
 	MaxConnsPerUser    int
 	SlowConsumerBuffer int
+	DisconnectSlowConsumers bool
+	MaxFriendSubscriptions  int
 
 	// CORS settings
 	CORSAllowedOrigins []string
@@ -77,7 +80,7 @@ type Config struct {
 	Environment string
 }
 
-// Load reads configuration based on USERENGINE_ENVIRONMENT variable.
+// Load reads configuration based on ENVIRONMENT (or USERENGINE_ENVIRONMENT for backward compatibility).
 // Similar to Django's settings/__init__.py pattern.
 //
 // Environment selection (defaults to "development" if not set):
@@ -90,8 +93,14 @@ func Load() *Config {
 	// Load .env file(s) before reading environment variables
 	loadEnvFile()
 
-	// Get environment from USERENGINE_ENVIRONMENT (defaults to development)
-	env := getEnv("USERENGINE_ENVIRONMENT", "development")
+	// Get environment (ENVIRONMENT preferred; USERENGINE_ENVIRONMENT supported for older setups)
+	env := os.Getenv("ENVIRONMENT")
+	if env == "" {
+		env = os.Getenv("USERENGINE_ENVIRONMENT")
+	}
+	if env == "" {
+		env = "development"
+	}
 
 	// Print active configuration
 	fmt.Printf("\n%s\nUserEngine is running on %s configuration\n%s\n\n",
@@ -158,6 +167,41 @@ func (c *Config) Validate() error {
 		errors = append(errors, ValidationError{
 			Field:   "REDIS_ADDR",
 			Message: "Redis address is required",
+		})
+	}
+
+	if c.WorkerHealthAddr == "" {
+		errors = append(errors, ValidationError{
+			Field:   "WORKER_HEALTH_ADDR",
+			Message: "Worker health address is required (set WORKER_HEALTH_ADDR or leave default)",
+		})
+	}
+
+	if c.MaxMessageSize <= 0 {
+		errors = append(errors, ValidationError{
+			Field:   "MAX_MESSAGE_SIZE",
+			Message: "MAX_MESSAGE_SIZE must be > 0",
+		})
+	}
+
+	if c.MaxPendingEvents <= 0 {
+		errors = append(errors, ValidationError{
+			Field:   "MAX_PENDING_EVENTS",
+			Message: "MAX_PENDING_EVENTS must be > 0",
+		})
+	}
+
+	if c.SlowConsumerBuffer <= 0 {
+		errors = append(errors, ValidationError{
+			Field:   "SLOW_CONSUMER_BUFFER",
+			Message: "SLOW_CONSUMER_BUFFER must be > 0",
+		})
+	}
+
+	if c.RedisClusterEnabled && len(c.RedisClusterAddrs) == 0 {
+		errors = append(errors, ValidationError{
+			Field:   "REDIS_CLUSTER_ADDRS",
+			Message: "REDIS_CLUSTER_ADDRS must be set when REDIS_CLUSTER_ENABLED=true",
 		})
 	}
 
