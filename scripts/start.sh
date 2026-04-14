@@ -122,15 +122,26 @@ check_redis() {
 }
 
 build_services() {
-    echo -e "${YELLOW}Building services (via PowerShell)...${NC}"
     mkdir -p "$BIN_DIR"
-    
     cd "$PROJECT_DIR"
-    # Use powershell to invoke go build, creating Windows executables (.exe)
-    powershell.exe -Command "go build -o bin/gateway.exe ./cmd/gateway"
-    powershell.exe -Command "go build -o bin/api.exe ./cmd/api"
-    powershell.exe -Command "go build -o bin/sweeper.exe ./cmd/worker-sweeper"
-    powershell.exe -Command "go build -o bin/debouncer.exe ./cmd/worker-debouncer"
+    
+    # Check if Go is available natively in WSL
+    if command -v go &> /dev/null; then
+        echo -e "${YELLOW}Building services (native Linux binaries)...${NC}"
+        go build -o bin/gateway ./cmd/gateway
+        go build -o bin/api ./cmd/api
+        go build -o bin/sweeper ./cmd/worker-sweeper
+        go build -o bin/debouncer ./cmd/worker-debouncer
+    else
+        # Cross-compile Linux binaries via PowerShell (Windows Go with GOOS=linux)
+        # This produces native Linux binaries that run directly in WSL,
+        # binding to WSL's localhost (same network as Django).
+        echo -e "${YELLOW}Building services (cross-compile Linux via Windows Go)...${NC}"
+        powershell.exe -Command "\$env:GOOS='linux'; \$env:GOARCH='amd64'; go build -o bin/gateway ./cmd/gateway"
+        powershell.exe -Command "\$env:GOOS='linux'; \$env:GOARCH='amd64'; go build -o bin/api ./cmd/api"
+        powershell.exe -Command "\$env:GOOS='linux'; \$env:GOARCH='amd64'; go build -o bin/sweeper ./cmd/worker-sweeper"
+        powershell.exe -Command "\$env:GOOS='linux'; \$env:GOARCH='amd64'; go build -o bin/debouncer ./cmd/worker-debouncer"
+    fi
     
     echo -e "${GREEN}✓ All services built${NC}"
 }
@@ -141,18 +152,26 @@ start_service() {
     local log_file="$LOG_DIR/${name}.log"
     local pid_file="$LOG_DIR/${name}.pid"
     
-    # Check if already running (Windows check via PowerShell)
-    if powershell.exe -Command "Get-Process -Name '$name' -ErrorAction SilentlyContinue" > /dev/null 2>&1; then
-        echo -e "${YELLOW}○ $name is already running (checked via PowerShell)${NC}"
-        # If PID file exists but process is controlled by Windows, just keep it or ignore it.
-        # But if it's stale, we might want to update it?
-        # For now, just return 0 to skip starting.
-        return 0
-    fi
+    # Detect if this is a native Linux binary or Windows .exe
+    local is_exe=false
+    [[ "$binary" == *.exe ]] && is_exe=true
     
-    # Check PID file (legacy/fallback, mostly to clean up stale files)
-    if [ -f "$pid_file" ]; then
-        rm -f "$pid_file"
+    if [ "$is_exe" = true ]; then
+        # Windows .exe: check via PowerShell
+        if powershell.exe -Command "Get-Process -Name '$name' -ErrorAction SilentlyContinue" > /dev/null 2>&1; then
+            echo -e "${YELLOW}○ $name is already running (Windows process)${NC}"
+            return 0
+        fi
+    else
+        # Native Linux binary: check via PID file
+        if [ -f "$pid_file" ]; then
+            local old_pid=$(cat "$pid_file")
+            if kill -0 "$old_pid" 2>/dev/null; then
+                echo -e "${YELLOW}○ $name is already running (PID: $old_pid)${NC}"
+                return 0
+            fi
+            rm -f "$pid_file"
+        fi
     fi
     
     echo -e "${BLUE}Starting $name...${NC}"
@@ -162,8 +181,11 @@ start_service() {
     export JWT_SECRET
     export GATEWAY_ADDR
     export API_ADDR
-    # Ensure Windows processes inherit these environment variables
-    export WSLENV=REDIS_ADDR:JWT_SECRET:GATEWAY_ADDR:API_ADDR
+    
+    if [ "$is_exe" = true ]; then
+        # Ensure Windows processes inherit these environment variables
+        export WSLENV=REDIS_ADDR:JWT_SECRET:GATEWAY_ADDR:API_ADDR
+    fi
     
     nohup "$binary" > "$log_file" 2>&1 &
     local pid=$!
@@ -183,11 +205,20 @@ start_service() {
 start_all() {
     mkdir -p "$LOG_DIR"
     
-    # Start services (using .exe binaries)
-    start_service "gateway" "$BIN_DIR/gateway.exe"
-    start_service "api" "$BIN_DIR/api.exe"
-    start_service "sweeper" "$BIN_DIR/sweeper.exe"
-    start_service "debouncer" "$BIN_DIR/debouncer.exe"
+    # Detect which binaries are available (prefer native Linux over .exe)
+    if [ -f "$BIN_DIR/gateway" ]; then
+        local ext=""
+    elif [ -f "$BIN_DIR/gateway.exe" ]; then
+        local ext=".exe"
+    else
+        echo -e "${RED}✗ No binaries found. Run with --build flag.${NC}"
+        return 1
+    fi
+    
+    start_service "gateway" "$BIN_DIR/gateway${ext}"
+    start_service "api" "$BIN_DIR/api${ext}"
+    start_service "sweeper" "$BIN_DIR/sweeper${ext}"
+    start_service "debouncer" "$BIN_DIR/debouncer${ext}"
     
     echo ""
     echo -e "${GREEN}═══════════════════════════════════════════${NC}"
@@ -209,15 +240,22 @@ print_banner
 check_redis || exit 1
 
 # Build if requested or binaries don't exist
-if [ "$BUILD" = true ] || [ ! -f "$BIN_DIR/gateway.exe" ]; then
+if [ "$BUILD" = true ] || { [ ! -f "$BIN_DIR/gateway" ] && [ ! -f "$BIN_DIR/gateway.exe" ]; }; then
     build_services
 fi
 
 # Start all services
 start_all
 
-# Keep running in foreground by default when called from Make
-echo -e "${YELLOW}Services started. Press Ctrl+C to stop...${NC}"
-trap "./scripts/stop.sh; exit 0" SIGINT SIGTERM
-wait
-
+#
+# NOTE:
+# -----
+# We intentionally do NOT block here.
+# - When launched via the monorepo's ./ops.sh start userengine, this script
+#   should return so that the wrapper can immediately tail the log files.
+# - Services are cross-compiled as native Linux binaries (GOOS=linux) and run
+#   directly in WSL, binding to WSL's localhost. This ensures Django (also in
+#   WSL) can reach them on localhost:<port>.
+# - Stopping is handled via ./scripts/stop.sh (or ops.sh ... stop).
+# If you want a blocking foreground mode, you can wrap this script and add
+# your own trap/wait logic there.

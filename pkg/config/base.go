@@ -13,20 +13,76 @@ import (
 // EnvFile is the default .env file name.
 const EnvFile = ".env"
 
+// userEngineEnvFileEnvVar allows callers (scripts, CI, docker) to force a specific env file path.
+const userEngineEnvFileEnvVar = "USERENGINE_ENV_FILE"
+
 // loadEnvFile attempts to load environment variables from .env files.
 func loadEnvFile() {
+	// 1) Explicit override: highest priority.
+	if explicit := os.Getenv(userEngineEnvFileEnvVar); explicit != "" {
+		if _, err := os.Stat(explicit); err == nil {
+			_ = godotenv.Load(explicit) // Ignore errors; env vars are optional
+			return
+		}
+	}
+
+	// 2) Prefer env next to the UserEngine Go module root (go.mod).
+	// This avoids accidentally loading an unrelated monorepo root ".env" when
+	// the binary is started from the workspace root.
+	if moduleRoot := findUserEngineModuleRoot(); moduleRoot != "" {
+		// Load both base and local override if present (local wins due to later load).
+		candidates := []string{
+			filepath.Join(moduleRoot, ".env"),
+			filepath.Join(moduleRoot, ".env.local"),
+		}
+		for _, p := range candidates {
+			if _, err := os.Stat(p); err == nil {
+				_ = godotenv.Load(p)
+			}
+		}
+	}
+
+	// 3) Backwards-compatible fallbacks (legacy behavior).
 	locations := []string{
 		EnvFile,                            // Current directory
 		filepath.Join("..", EnvFile),       // Parent directory
 		filepath.Join("..", "..", EnvFile), // Grandparent (for cmd/*/main.go)
 	}
-
 	for _, loc := range locations {
 		if _, err := os.Stat(loc); err == nil {
-			godotenv.Load(loc) // Ignore errors, env vars are optional
+			_ = godotenv.Load(loc) // Ignore errors, env vars are optional
 			break
 		}
 	}
+}
+
+// findUserEngineModuleRoot tries to locate the UserEngine Go module root directory.
+// It first walks up from the current working directory looking for "go.mod".
+// If none is found (common in monorepos), it falls back to "BACKENDs/userengine/go.mod"
+// relative to the current working directory.
+func findUserEngineModuleRoot() string {
+	wd, err := os.Getwd()
+	if err == nil && wd != "" {
+		dir := wd
+		for i := 0; i < 10; i++ {
+			if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+				return dir
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+
+	// Monorepo fallback (workspace root -> BACKENDs/userengine).
+	monorepoModule := filepath.Join("BACKENDs", "userengine")
+	if _, err := os.Stat(filepath.Join(monorepoModule, "go.mod")); err == nil {
+		return monorepoModule
+	}
+
+	return ""
 }
 
 // baseConfig returns the base configuration with common defaults.
@@ -41,8 +97,8 @@ func baseConfig() *Config {
 		RedisClusterAddrs:   getEnvStringSlice("REDIS_CLUSTER_ADDRS", nil),
 
 		// Service addresses
-		GatewayAddr: getEnv("GATEWAY_ADDR", ":8080"),
-		APIAddr:     getEnv("API_ADDR", ":8081"),
+		GatewayAddr:      getEnv("GATEWAY_ADDR", ":8080"),
+		APIAddr:          getEnv("API_ADDR", ":8081"),
 		WorkerHealthAddr: getEnv("WORKER_HEALTH_ADDR", ":8080"),
 
 		// Webhooks - common settings
@@ -60,10 +116,10 @@ func baseConfig() *Config {
 		OfflineDelay:      getEnvDuration("OFFLINE_DELAY", 15*time.Second),
 
 		// Gateway - common settings
-		WriteTimeout:   getEnvDuration("WRITE_TIMEOUT", 10*time.Second),
-		PongWait:       getEnvDuration("PONG_WAIT", 60*time.Second),
-		PingPeriod:     getEnvDuration("PING_PERIOD", 54*time.Second),
-		MaxMessageSize: int64(getEnvInt("MAX_MESSAGE_SIZE", 4096)),
+		WriteTimeout:            getEnvDuration("WRITE_TIMEOUT", 10*time.Second),
+		PongWait:                getEnvDuration("PONG_WAIT", 60*time.Second),
+		PingPeriod:              getEnvDuration("PING_PERIOD", 54*time.Second),
+		MaxMessageSize:          int64(getEnvInt("MAX_MESSAGE_SIZE", 4096)),
 		DisconnectSlowConsumers: getEnvBool("DISCONNECT_SLOW_CONSUMERS", false),
 		MaxFriendSubscriptions:  getEnvInt("MAX_FRIEND_SUBSCRIPTIONS", 1000),
 	}

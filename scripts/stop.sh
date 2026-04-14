@@ -17,22 +17,55 @@ echo -e "${YELLOW}Stopping UserEngine services...${NC}"
 
 stop_service() {
     local name=$1
-    local binary_name="${name}.exe"
-    
-    # Try to kill by name using Windows taskkill (more reliable/aggressive for this setup)
-    if powershell.exe -Command "Get-Process -Name '$name' -ErrorAction SilentlyContinue" > /dev/null; then
-        echo -e "${YELLOW}Stopping $name...${NC}"
-        # /F = force, /IM = image name, /T = tree (kill children)
-        powershell.exe -Command "taskkill /F /IM '$binary_name' /T" > /dev/null 2>&1
-        echo -e "${GREEN}✓ Stopped $binary_name${NC}"
-    else
-        echo -e "${YELLOW}○ $name not running (checked via PowerShell)${NC}"
+    local stopped=false
+
+    # Helper: gracefully kill a PID, then force if needed
+    kill_pid() {
+        local pid=$1
+        kill "$pid" 2>/dev/null || true
+        for i in 1 2 3; do
+            kill -0 "$pid" 2>/dev/null || { stopped=true; return; }
+            sleep 1
+        done
+        kill -9 "$pid" 2>/dev/null || true
+        stopped=true
+    }
+
+    # 1. Try every known PID file location (centralized log dir and local fallback)
+    local -a pid_files=(
+        "$LOG_DIR/${name}.pid"
+        "$(dirname "$SCRIPT_DIR")/logs/${name}.pid"
+    )
+    for pid_file in "${pid_files[@]}"; do
+        if [ -f "$pid_file" ]; then
+            local pid
+            pid=$(cat "$pid_file")
+            if kill -0 "$pid" 2>/dev/null; then
+                echo -e "${YELLOW}Stopping $name (PID: $pid from $pid_file)...${NC}"
+                kill_pid "$pid"
+            fi
+            rm -f "$pid_file"
+        fi
+    done
+
+    # 2. Fallback: kill any remaining process matching the binary name exactly
+    #    (covers cases where PID files are missing, stale, or in unexpected locations)
+    if pgrep -x "$name" > /dev/null 2>&1; then
+        if [ "$stopped" = false ]; then
+            echo -e "${YELLOW}Stopping $name (by name, no PID file found)...${NC}"
+        else
+            echo -e "${YELLOW}Cleaning up extra $name process(es)...${NC}"
+        fi
+        pkill -x "$name" 2>/dev/null || true
+        sleep 1
+        pkill -9 -x "$name" 2>/dev/null || true
+        stopped=true
     fi
 
-    # Clean up pid file if it exists, just in case
-    local pid_file="$LOG_DIR/${name}.pid"
-    if [ -f "$pid_file" ]; then
-        rm -f "$pid_file"
+    if [ "$stopped" = true ]; then
+        echo -e "${GREEN}✓ Stopped $name${NC}"
+    else
+        echo -e "${YELLOW}○ $name not running${NC}"
     fi
 }
 
