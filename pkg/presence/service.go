@@ -31,6 +31,10 @@ type TransitionResult struct {
 	Version    int64  `json:"version"`    // monotonic version for deduplication
 	// SessionCount is the current number of sessions (tabs) for the user.
 	SessionCount int64 `json:"session_count"`
+	// AggregatedPresence is active/idle/dnd after this operation (empty if user went offline).
+	AggregatedPresence string `json:"aggregated_presence,omitempty"`
+	// PresenceChanged is true when per-tab state merge changed and was written to last_pub.
+	PresenceChanged bool `json:"presence_changed,omitempty"`
 }
 
 // SessionMeta holds session metadata (write-once at connect).
@@ -302,6 +306,13 @@ func (s *Service) Disconnect(ctx context.Context, scopeID, sessionID, userID str
 		// Decrement device count
 		s.rdb.HIncrBy(ctx, s.keys.UserDevices(scopeID, userID), deviceType, -1)
 	}
+
+	agg, pChanged, err := s.applyDisconnectPresenceState(ctx, scopeID, userID, sessionID, transitionResult.Transition == "offline")
+	if err != nil {
+		return nil, err
+	}
+	transitionResult.AggregatedPresence = agg
+	transitionResult.PresenceChanged = pChanged
 
 	return transitionResult, nil
 }

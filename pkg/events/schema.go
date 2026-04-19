@@ -9,9 +9,10 @@ import (
 
 // Event types
 const (
-	EventTypeUserOnline  = "user_online"
-	EventTypeUserOffline = "user_offline"
-	EventTypeUserTabs    = "user_tabs"
+	EventTypeUserOnline    = "user_online"
+	EventTypeUserOffline   = "user_offline"
+	EventTypeUserTabs      = "user_tabs"
+	EventTypeUserPresence  = "user_presence"
 )
 
 // PresenceEvent is the canonical presence event schema.
@@ -22,11 +23,15 @@ type PresenceEvent struct {
 	// ScopeID identifies the tenant/workspace.
 	ScopeID string `json:"scope_id"`
 
-	// Type is the event type: user_online, user_offline, or user_tabs.
+	// Type is the event type: user_online, user_offline, user_tabs, or user_presence.
 	Type string `json:"type"`
 
 	// UserID is the user this event is about.
 	UserID string `json:"user_id"`
+
+	// State is aggregate presence for online users: active, idle, or dnd.
+	// Sent on user_online, user_tabs, and user_presence when applicable.
+	State string `json:"state,omitempty"`
 
 	// Version is a monotonic counter per user for ordering/deduplication.
 	// Clients should apply events only if version > last_seen_version.

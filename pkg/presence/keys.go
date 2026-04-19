@@ -128,6 +128,20 @@ func (k Key) UserDevices(scopeID, userID string) string {
 	return fmt.Sprintf("presence:user_devices:%s", tag)
 }
 
+// UserSessionStates maps session_id -> per-tab presence state (active, idle, dnd).
+// Hash tag: {scope_id:user_id} for user-scoped operations
+func (k Key) UserSessionStates(scopeID, userID string) string {
+	tag := k.hashTag(scopeID + ":" + userID)
+	return fmt.Sprintf("presence:session_states:%s", tag)
+}
+
+// UserLastPublishedPresence stores the last broadcast aggregate state for change detection.
+// Hash tag: {scope_id:user_id} for user-scoped operations
+func (k Key) UserLastPublishedPresence(scopeID, userID string) string {
+	tag := k.hashTag(scopeID + ":" + userID)
+	return fmt.Sprintf("presence:last_pub_presence:%s", tag)
+}
+
 // Transitions returns the key for tracking presence transitions for a user.
 // Used for flapping detection.
 // Value: ZSET of timestamps within a time window.

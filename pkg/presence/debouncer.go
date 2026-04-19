@@ -366,6 +366,15 @@ func (d *Debouncer) executeJob(ctx context.Context, scopeID, jobID string) error
 		}
 	} else if result.SessionCount > 0 {
 		// Tab count changes are always published (not affected by flapping)
+		agg := result.AggregatedPresence
+		if agg == "" {
+			var err error
+			agg, err = d.svc.GetPresenceAggregate(ctx, scopeID, userID)
+			if err != nil {
+				agg = PresenceStateActive
+			}
+		}
+
 		event := events.PresenceEvent{
 			EventID:    events.NewEventID(),
 			ScopeID:    scopeID,
@@ -373,6 +382,7 @@ func (d *Debouncer) executeJob(ctx context.Context, scopeID, jobID string) error
 			UserID:     userID,
 			Version:    result.Version,
 			TabCount:   result.SessionCount,
+			State:      agg,
 			OccurredAt: time.Now().UTC(),
 			Source:     "debouncer",
 		}
@@ -382,6 +392,26 @@ func (d *Debouncer) executeJob(ctx context.Context, scopeID, jobID string) error
 				Str("scope_id", scopeID).
 				Str("user_id", userID).
 				Msg("failed to publish tab count event")
+		}
+
+		if result.PresenceChanged && agg != "" {
+			pe := events.PresenceEvent{
+				EventID:    events.NewEventID(),
+				ScopeID:    scopeID,
+				Type:       events.EventTypeUserPresence,
+				UserID:     userID,
+				Version:    result.Version,
+				TabCount:   result.SessionCount,
+				State:      agg,
+				OccurredAt: time.Now().UTC(),
+				Source:     "debouncer",
+			}
+			if err := d.eventBus.Publish(ctx, scopeID, pe); err != nil {
+				log.Error().Err(err).
+					Str("scope_id", scopeID).
+					Str("user_id", userID).
+					Msg("failed to publish user_presence after tab disconnect")
+			}
 		}
 	}
 

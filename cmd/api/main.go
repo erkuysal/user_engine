@@ -312,6 +312,10 @@ func handleDisconnectUser(w http.ResponseWriter, r *http.Request, svc *presence.
 			log.Error().Err(err).Str("scope_id", req.ScopeID).Str("user_id", req.UserID).Msg("failed to publish offline event")
 		}
 	} else if result.SessionCount > 0 {
+		agg, aggErr := svc.GetPresenceAggregate(r.Context(), req.ScopeID, req.UserID)
+		if aggErr != nil {
+			agg = presence.PresenceStateActive
+		}
 		event := events.PresenceEvent{
 			EventID:    events.NewEventID(),
 			ScopeID:    req.ScopeID,
@@ -319,6 +323,7 @@ func handleDisconnectUser(w http.ResponseWriter, r *http.Request, svc *presence.
 			UserID:     req.UserID,
 			Version:    result.Version,
 			TabCount:   result.SessionCount,
+			State:      agg,
 			OccurredAt: time.Now().UTC(),
 			Source:     "api",
 		}

@@ -126,6 +126,8 @@ func (c *Client) ReadPump() {
 			c.handleHeartbeat()
 		case "subscribe_friends":
 			c.handleSubscribeFriends(msg.Payload)
+		case "presence_state":
+			c.handlePresenceState(msg.Payload)
 		}
 	}
 }
@@ -244,6 +246,14 @@ func (c *Client) connect() error {
 		return err
 	}
 
+	if err := svc.InitSessionPresenceOnConnect(ctx, c.scopeID, c.userID, c.sessionID, result.SessionCount); err != nil {
+		log.Warn().Err(err).Str("user_id", c.userID).Msg("init session presence failed")
+	}
+	agg, aggErr := svc.GetPresenceAggregate(ctx, c.scopeID, c.userID)
+	if aggErr != nil {
+		agg = presence.PresenceStateActive
+	}
+
 	// If user came online, publish event (unless invisible)
 	if result.Transition == "online" && !c.invisible {
 		event := events.PresenceEvent{
@@ -253,6 +263,7 @@ func (c *Client) connect() error {
 			UserID:     c.userID,
 			Version:    result.Version,
 			TabCount:   result.SessionCount,
+			State:      agg,
 			OccurredAt: time.Now().UTC(),
 			Source:     "gateway",
 			DeviceID:   c.deviceID,
@@ -274,6 +285,7 @@ func (c *Client) connect() error {
 			UserID:     c.userID,
 			Version:    result.Version,
 			TabCount:   result.SessionCount,
+			State:      agg,
 			OccurredAt: time.Now().UTC(),
 			Source:     "gateway",
 			DeviceID:   c.deviceID,
@@ -375,6 +387,47 @@ func (c *Client) sendReconnectRequired(reason string) {
 		Str("session_id", c.sessionID).
 		Str("reason", reason).
 		Msg("sent reconnect_required")
+}
+
+// handlePresenceState updates this connection's per-tab presence (active / idle / dnd).
+func (c *Client) handlePresenceState(payload json.RawMessage) {
+	var p struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		log.Warn().Err(err).Str("session_id", c.sessionID).Msg("invalid presence_state payload")
+		return
+	}
+
+	ctx := context.Background()
+	svc := c.hub.PresenceService()
+	res, err := svc.SetSessionPresenceState(ctx, c.scopeID, c.userID, c.sessionID, p.State)
+	if err != nil {
+		if err == presence.ErrInvalidPresenceState {
+			log.Warn().Str("state", p.State).Str("session_id", c.sessionID).Msg("presence_state rejected")
+		}
+		return
+	}
+	if res == nil || !res.Published {
+		return
+	}
+
+	event := events.PresenceEvent{
+		EventID:    events.NewEventID(),
+		ScopeID:    c.scopeID,
+		Type:       events.EventTypeUserPresence,
+		UserID:     c.userID,
+		Version:    res.Version,
+		TabCount:   res.TabCount,
+		State:      res.Aggregate,
+		OccurredAt: time.Now().UTC(),
+		Source:     "gateway",
+		DeviceID:   c.deviceID,
+	}
+
+	if err := c.hub.EventBus.Publish(ctx, c.scopeID, event); err != nil {
+		log.Error().Err(err).Str("user_id", c.userID).Msg("failed to publish user_presence")
+	}
 }
 
 // handleSubscribeFriends handles friend subscription requests.

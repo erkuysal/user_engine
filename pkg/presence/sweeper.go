@@ -211,6 +211,7 @@ func (s *Sweeper) sweepUser(ctx context.Context, scopeID, userID string) (pruned
 				Str("session_key", sessionKey).
 				Msg("[DEBUG] sweeper: session EXPIRED - Redis key not found, removing from user sessions")
 			rdb.SRem(ctx, userSessionsKey, sessionID)
+			_ = rdb.HDel(ctx, keys.UserSessionStates(scopeID, userID), sessionID).Err()
 			prunedCount++
 		} else {
 			log.Debug().
@@ -259,10 +260,18 @@ func (s *Sweeper) sweepUser(ctx context.Context, scopeID, userID string) (pruned
 				Msg("failed to publish offline event")
 		}
 
+		_ = rdb.Del(ctx, keys.UserSessionStates(scopeID, userID), keys.UserLastPublishedPresence(scopeID, userID)).Err()
+
 		wentOffline = true
 	} else if prunedCount > 0 {
 		versionKey := keys.UserVersion(scopeID, userID)
 		version, _ := rdb.Incr(ctx, versionKey).Result()
+
+		agg, aggErr := s.svc.GetPresenceAggregate(ctx, scopeID, userID)
+		if aggErr != nil {
+			agg = PresenceStateActive
+		}
+		_ = rdb.Set(ctx, keys.UserLastPublishedPresence(scopeID, userID), agg, 0).Err()
 
 		event := events.PresenceEvent{
 			EventID:    events.NewEventID(),
@@ -271,6 +280,7 @@ func (s *Sweeper) sweepUser(ctx context.Context, scopeID, userID string) (pruned
 			UserID:     userID,
 			Version:    version,
 			TabCount:   int64(remaining),
+			State:      agg,
 			OccurredAt: time.Now().UTC(),
 			Source:     "sweeper",
 		}
