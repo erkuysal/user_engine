@@ -1,0 +1,27 @@
+# Source control
+.git
+.gitignore
+
+# Runtime secrets and local environment
+.env
+.env.*
+*.pem
+*.key
+
+# Local build outputs
+bin/
+dist/
+tmp/
+*.log
+
+# Development-only content
+test/
+docs/
+scripts/
+.vscode/
+.idea/
+
+# Compose and Docker metadata are not needed by the image build
+Dockerfile*
+docker-compose*
+.dockerignore
